@@ -1,0 +1,14 @@
+{
+    "confidence": 100.0,
+    "prediction": "heat_stress",
+    "reasons": [
+        "Leaf temperature delta is elevated",
+        "Air temperature is rising rapidly",
+        "Humidity is dropping rapidly",
+        "Root-zone temperature is high"
+    ],
+    "recommendation": "Increase cooling or misting immediately",
+    "risk_state": "critical",
+    "severity": 96,
+    "time": "14:00"
+}
