@@ -8,9 +8,10 @@ AI_DIR = os.path.abspath(os.path.join(BASE_DIR, "../ai"))
 sys.path.append(AI_DIR)
 
 from unified_engine import unified_analysis
-from biology_engine import evaluate_biology
-from fuzzy_search import search_plants
-from plant_pipeline import get_dynamic_plant_profile
+from backend.biology_engine import evaluate_biology
+from backend.fuzzy_search import search_plants
+from backend.plant_pipeline import get_dynamic_plant_profile
+
 
 app = Flask(__name__)
 CORS(app)
