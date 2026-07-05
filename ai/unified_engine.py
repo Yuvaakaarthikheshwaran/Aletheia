@@ -1,11 +1,19 @@
+
 import joblib
 import pandas as pd
 import numpy as np
+import os
 
 from decision_engine import analyze
 from sensor_guard import validate_sensor_data
 
-temporal_model = joblib.load("../temporal_ai/aletheia_temporal_v51.pkl")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.abspath(
+    os.path.join(BASE_DIR, "../temporal_ai/aletheia_temporal_v51.pkl")
+)
+
+temporal_model = joblib.load(MODEL_PATH)
+
 
 
 def detect_anomaly(sensor_data):
