@@ -1,3 +1,10 @@
+
+import os
+print("TAVILY SECRET LOADED:", os.getenv("TAVILY_API_KEY") is not None)
+print("OPENROUTER SECRET LOADED:", os.getenv("OPENROUTER_API_KEY") is not None)
+
+
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 import random

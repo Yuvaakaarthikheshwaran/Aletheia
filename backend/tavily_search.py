@@ -1,10 +1,15 @@
+
 from tavily import TavilyClient
 import os
 from dotenv import load_dotenv
+import traceback
 
 load_dotenv()
 
-client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+api_key = os.getenv("TAVILY_API_KEY")
+print("TAVILY KEY EXISTS:", api_key is not None)
+
+client = TavilyClient(api_key=api_key)
 
 
 def search_plant_tavily(plant_name):
@@ -20,8 +25,11 @@ def search_plant_tavily(plant_name):
             search_depth="advanced",
             max_results=8
         )
+        print("TAVILY SUCCESS")
         return response
 
     except Exception as e:
-        print(e)
+        print("TAVILY ERROR:", str(e))
+        traceback.print_exc()
         return None
+
