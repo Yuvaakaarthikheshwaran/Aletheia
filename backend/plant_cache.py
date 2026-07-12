@@ -1,7 +1,8 @@
 import json
 import os
 
-CACHE_FILE = "plant_cache.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(BASE_DIR, "plant_cache.json")
 
 
 def load_cache():
