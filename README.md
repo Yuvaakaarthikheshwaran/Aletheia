@@ -129,7 +129,7 @@ npm run dev
 | `TAVILY_API_KEY_1` | Yes | Primary Tavily search API key |
 | `TAVILY_API_KEY_BE` | Yes | Backup Tavily search API key |
 | `TAVILY_API_KEY` | Yes | Fallback Tavily search API key |
-| `OPENROUTER_API_KEY` | Yes | OpenRouter LLM API key for AI reasoning |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter LLM API key for synthetic data conversion |
 | `CORS_ALLOWED_ORIGINS` | No | Comma-separated allowed origins (default: `*`) |
 | `NEXT_PUBLIC_API_URL` | Yes (Frontend) | Backend API URL for frontend |
 
