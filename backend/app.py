@@ -12,6 +12,14 @@ Endpoints:
 import os
 import sys
 import traceback
+import logging
+from datetime import datetime, timezone
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -31,8 +39,21 @@ from backend.simulator import GreenhouseSimulator, SCENARIOS
 # Global simulator instance (singleton for the Flask process)
 _simulator = GreenhouseSimulator()
 
+# Hardware Integration Layer (additive — does not modify existing pipeline)
+from backend.hardware import validate_hardware_packet, HardwareStore, CalibrationManager
+
+# Global hardware instances (singletons for the Flask process)
+_hardware_store = HardwareStore()
+_calibration = CalibrationManager()
+
 app = Flask(__name__)
-CORS(app)
+
+# CORS: Allow frontend origin via environment variable, with secure defaults
+_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*")
+if _ALLOWED_ORIGINS == "*":
+    CORS(app)
+else:
+    CORS(app, origins=_ALLOWED_ORIGINS.split(","))
 
 
 @app.route("/")
@@ -257,11 +278,15 @@ def simulator_analyze():
 
     The sensor_stream (historical sensor data) is passed to the Temporal AI
     so it uses real prev1/prev2 values instead of synthetic fallbacks.
+
+    ANALYSIS SNAPSHOTS: The AI analysis is stored back into the simulator's
+    history entry so that comparison mode can later retrieve "what did
+    Aletheia predict at minute X, and what actually happened at minute X+30?"
     """
     body = request.get_json(silent=True) or {}
     dt = body.get("dt_minutes", _simulator.speed)
 
-    # Step simulator
+    # Step simulator first (without analysis — we need sensor_data to run pipeline)
     sim_state = _simulator.step(dt_minutes=dt)
     sensor_data = sim_state["sensor_data"]
 
@@ -289,6 +314,23 @@ def simulator_analyze():
         sensor_stream=sensor_stream,
     )
 
+    # --- Store analysis snapshot into simulator history ---
+    # Replace the last history entry (which has no analysis) with one that does.
+    # This enables comparison mode: "at minute X, Aletheia predicted Y; at X+30, reality was Z"
+    if _simulator.history:
+        last_entry = _simulator.history[-1]
+        last_entry["analysis_snapshot"] = {
+            "plant_name": plant_name,
+            "growth_stage": growth_stage,
+            "temporal_prediction": analysis.get("temporal_prediction"),
+            "stress_analysis": analysis.get("stress_analysis"),
+            "biology_analysis": analysis.get("biology_analysis"),
+            "recommendations": analysis.get("recommendations"),
+            "confidence": analysis.get("confidence"),
+            "ai_reasoning": analysis.get("ai_reasoning"),
+            "decision_input": analysis.get("decision_input"),
+        }
+
     # Build historical trajectory for frontend visualization
     full_history = _simulator.get_history(n_history)
     trajectory = []
@@ -303,6 +345,10 @@ def simulator_analyze():
             "light": h["sensor_data"].get("light"),
             "stress": h["plant"].get("stress", 0),
             "growth": h["plant"].get("growth", 0),
+            # Include analysis snapshot metadata for comparison mode
+            "has_snapshot": h.get("analysis_snapshot") is not None,
+            "temporal_label": h.get("analysis_snapshot", {}).get("temporal_prediction", {}).get("future_state", {}).get("future_prediction") if h.get("analysis_snapshot") else None,
+            "stress_label": h.get("analysis_snapshot", {}).get("stress_analysis", {}).get("prediction") if h.get("analysis_snapshot") else None,
         })
 
     return jsonify({
@@ -507,6 +553,658 @@ def temporal_accuracy():
         "total_verified": len(accuracies),
         "verification_details": accuracies[-window:] if len(accuracies) > window else accuracies,
     })
+
+
+# ============================================================
+# Temporal AI — Historical Snapshots & Comparison Mode
+# ============================================================
+
+@app.route("/simulator/temporal/snapshots", methods=["GET"])
+def temporal_snapshots():
+    """
+    Return all historical entries that have analysis snapshots attached.
+    These are the "proper points in time" for comparison mode.
+
+    Query params:
+        ?limit=50   (max snapshots to return, default 50)
+        ?offset=0   (pagination offset)
+
+    Returns:
+        snapshots: list of history entries with analysis_snapshot
+        total_snapshots: count of all entries with snapshots
+    """
+    limit = request.args.get("limit", default=50, type=int)
+    offset = request.args.get("offset", default=0, type=int)
+
+    history = _simulator.get_history()
+    snapshots = [h for h in history if h.get("analysis_snapshot")]
+
+    total = len(snapshots)
+    page = snapshots[offset:offset + limit]
+
+    # Build lightweight response (exclude full causal_chain to reduce payload)
+    result = []
+    for h in page:
+        snap = h.get("analysis_snapshot", {})
+        result.append({
+            "sim_time": h.get("sim_time", ""),
+            "sim_minute": h.get("sim_minute", 0),
+            "day_phase": h.get("day_phase", ""),
+            "scenario": h.get("scenario", ""),
+            "sensor_data": h.get("sensor_data", {}),
+            "plant": h.get("plant", {}),
+            "weather": h.get("weather", {}),
+            "soil": h.get("soil", {}),
+            "temporal_prediction": snap.get("temporal_prediction"),
+            "stress_analysis": snap.get("stress_analysis"),
+            "biology_analysis": snap.get("biology_analysis"),
+            "recommendations": snap.get("recommendations"),
+            "confidence": snap.get("confidence"),
+            "ai_reasoning": snap.get("ai_reasoning"),
+            "decision_input": snap.get("decision_input"),
+            "plant_name": snap.get("plant_name"),
+            "growth_stage": snap.get("growth_stage"),
+        })
+
+    return jsonify({
+        "snapshots": result,
+        "total_snapshots": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+
+@app.route("/simulator/temporal/compare", methods=["GET"])
+def temporal_compare():
+    """
+    COMPARISON MODE: Select any historical prediction snapshot and compare
+    what Aletheia predicted with what actually happened at that future time.
+
+    This is the core scientific feature — "at minute X, Aletheia predicted Y;
+    at minute X+Δ, reality was Z. Error = |Y-Z|. Reason = ..."
+
+    Query params:
+        ?snapshot_minute=360   (the sim_minute when prediction was made)
+        ?compare_minute=390    (the sim_minute to compare against, default: snapshot + 30)
+        ?variables=air_temp,humidity,soil_moisture,leaf_temp_delta
+
+    Returns:
+        snapshot: the historical analysis at snapshot_minute
+        actual: the measured values at compare_minute
+        comparison: per-variable prediction vs actual with error
+        summary: overall accuracy assessment
+    """
+    snapshot_minute = request.args.get("snapshot_minute", type=int)
+    compare_minute = request.args.get("compare_minute", default=None, type=int)
+    variables_str = request.args.get("variables", default="air_temp,humidity,soil_moisture,leaf_temp_delta")
+
+    if snapshot_minute is None:
+        return jsonify({"error": "Missing snapshot_minute parameter"}), 400
+
+    variables = [v.strip() for v in variables_str.split(",")]
+
+    history = _simulator.get_history()
+
+    # Find the snapshot entry
+    snapshot_entry = None
+    snapshot_idx = None
+    best_diff = float("inf")
+    for i, h in enumerate(history):
+        if h.get("analysis_snapshot"):
+            diff = abs(h.get("sim_minute", 0) - snapshot_minute)
+            if diff < best_diff:
+                best_diff = diff
+                snapshot_entry = h
+                snapshot_idx = i
+
+    if snapshot_entry is None:
+        return jsonify({"error": "No analysis snapshot found near that minute. Run /simulator/analyze first."}), 404
+
+    # Default compare_minute = snapshot + 30 minutes
+    if compare_minute is None:
+        compare_minute = snapshot_entry.get("sim_minute", 0) + 30
+
+    # Find the actual entry at compare_minute
+    actual_entry = None
+    best_diff = float("inf")
+    for h in history:
+        diff = abs(h.get("sim_minute", 0) - compare_minute)
+        if diff < best_diff:
+            best_diff = diff
+            actual_entry = h
+
+    if actual_entry is None:
+        return jsonify({"error": "No data at compare_minute. Run more simulation steps first."}), 404
+
+    # Build comparison: for each variable, compare snapshot sensor_data with actual
+    snap_sensors = snapshot_entry.get("sensor_data", {})
+    actual_sensors = actual_entry.get("sensor_data", {})
+
+    comparisons = []
+    for var in variables:
+        pred_val = snap_sensors.get(var)
+        actual_val = actual_sensors.get(var)
+        if pred_val is not None and actual_val is not None:
+            error = abs(pred_val - actual_val)
+            error_pct = round((error / max(abs(actual_val), 0.01)) * 100, 2)
+            accuracy = max(0.0, round(100.0 - error_pct, 2))
+            comparisons.append({
+                "variable": var,
+                "predicted": round(pred_val, 4),
+                "actual": round(actual_val, 4),
+                "error": round(error, 4),
+                "error_pct": error_pct,
+                "accuracy": accuracy,
+            })
+
+    # Overall accuracy across all compared variables
+    if comparisons:
+        overall_accuracy = round(sum(c["accuracy"] for c in comparisons) / len(comparisons), 2)
+    else:
+        overall_accuracy = None
+
+    # Extract the temporal prediction label from the snapshot
+    snap = snapshot_entry.get("analysis_snapshot", {})
+    temporal_pred = snap.get("temporal_prediction", {})
+    future_state = temporal_pred.get("future_state", {}) if temporal_pred else {}
+    predicted_label = future_state.get("future_prediction", "unknown")
+
+    # Determine what actually happened (did stress occur?)
+    actual_stress = actual_entry.get("plant", {}).get("stress", 0)
+    actual_stress_label = "stress_detected" if actual_stress > 0.3 else "stable"
+
+    # Was the temporal prediction correct?
+    prediction_correct = (predicted_label == "stable" and actual_stress_label == "stable") or \
+                         (predicted_label != "stable" and actual_stress_label == "stress_detected")
+
+    return jsonify({
+        "snapshot": {
+            "sim_time": snapshot_entry.get("sim_time"),
+            "sim_minute": snapshot_entry.get("sim_minute"),
+            "scenario": snapshot_entry.get("scenario"),
+            "temporal_prediction": temporal_pred,
+            "stress_analysis": snap.get("stress_analysis"),
+            "recommendations": snap.get("recommendations"),
+            "ai_reasoning": snap.get("ai_reasoning"),
+        },
+        "actual": {
+            "sim_time": actual_entry.get("sim_time"),
+            "sim_minute": actual_entry.get("sim_minute"),
+            "sensor_data": {v: actual_sensors.get(v) for v in variables},
+            "plant": actual_entry.get("plant"),
+        },
+        "comparison": {
+            "variables": comparisons,
+            "overall_accuracy": overall_accuracy,
+            "predicted_label": predicted_label,
+            "actual_label": actual_stress_label,
+            "prediction_correct": prediction_correct,
+            "time_delta_minutes": compare_minute - snapshot_entry.get("sim_minute", 0),
+        },
+    })
+
+
+# ============================================================
+# Hardware Integration Endpoints (additive — no modifications above)
+# ============================================================
+
+@app.route("/hardware/update", methods=["POST"])
+def hardware_update():
+    """
+    ESP32 sends sensor packets. Backend: Validate → Calibrate → Store → Feed Pipeline → Return AI Response.
+
+    Input JSON (canonical schema — identical to VirtualSensors.read() output):
+    {
+        "timestamp": "2026-07-15T12:00:00Z",
+        "device_id": "ESP32-001",
+        "plant": "Tomato",
+        "stage": "Flowering",
+        "mode": "Day",
+        "firmware_version": "1.0.0",
+        "sensor_data": {
+            "air_temp": 31.4,
+            "humidity": 58.2,
+            "soil_temp": 28.1,
+            "soil_moisture": 46.8,
+            "light": 18200,
+            "leaf_temp": 33.5
+        }
+    }
+
+    Returns: Full unified analysis + hardware metadata.
+    """
+    try:
+        raw_body = request.get_data()
+
+        # Step 1: Validate hardware packet (runs BEFORE sensor_guard)
+        previous = _hardware_store.get_last_packet()
+        is_valid, packet, errors = validate_hardware_packet(raw_body, previous)
+
+        if not is_valid:
+            return jsonify({
+                "error": "validation_failed",
+                "message": "Hardware packet rejected",
+                "validation_errors": errors,
+            }), 400
+
+        # Step 2: Apply calibration
+        device_id = packet.get("device_id", "unknown")
+        sensor_data = packet.get("sensor_data", {})
+        sensor_data = _calibration.apply_calibration(device_id, sensor_data)
+        packet["sensor_data"] = sensor_data
+
+        # Step 3: Extract pipeline parameters
+        plant_name = packet.get("plant", "tomato")
+        growth_stage = packet.get("stage", "vegetative")
+        phase = packet.get("mode", "day").lower()
+
+        # Step 4: Get hardware sensor stream for temporal AI context
+        n_history = request.args.get("history_steps", default=60, type=int)
+        sensor_stream = _hardware_store.get_sensor_stream(n_history)
+
+        # Step 5: Feed into existing unified pipeline (unchanged)
+        analysis = run_unified_pipeline(
+            plant_name=plant_name,
+            growth_stage=growth_stage,
+            phase=phase,
+            sensor_data=sensor_data,
+            sensor_stream=sensor_stream,
+        )
+
+        # Step 6: Store packet with analysis snapshot for replay/comparison
+        stored_entry = _hardware_store.append(packet, analysis)
+
+        # Step 7: Build response
+        return jsonify({
+            "status": "accepted",
+            "device_id": device_id,
+            "packet_stored": True,
+            "validation_warnings": [e for e in errors if e.get("severity") == "warning"],
+            "analysis": analysis,
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "error": "hardware_update_failure",
+            "message": str(e),
+        }), 500
+
+
+@app.route("/hardware/status", methods=["GET"])
+def hardware_status():
+    """
+    Get current device connection status.
+    Returns: device_id, online/offline, last packet time, packet age, sampling rate, firmware version.
+    """
+    try:
+        status = _hardware_store.get_device_status()
+        return jsonify(status)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/hardware/history", methods=["GET"])
+def hardware_history():
+    """
+    Get hardware packet history.
+    Query params: ?n=60 (last 60 packets)
+    Returns list of stored entries + sensor_stream for temporal AI.
+    """
+    try:
+        n = request.args.get("n", default=60, type=int)
+        history = _hardware_store.get_history(n)
+        sensor_stream = _hardware_store.get_sensor_stream(n)
+        return jsonify({
+            "n_steps": len(history),
+            "history": history,
+            "sensor_stream": sensor_stream,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/hardware/calibration", methods=["GET"])
+def hardware_get_calibration():
+    """
+    Get calibration status for all sensors on a device.
+    Query params: ?device_id=ESP32-001
+    """
+    try:
+        device_id = request.args.get("device_id", default="ESP32-001", type=str)
+        calibrations = _calibration.get_all_calibrations(device_id)
+        devices = _calibration.list_devices()
+        return jsonify({
+            "device_id": device_id,
+            "calibrations": calibrations,
+            "all_calibrated_devices": devices,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/hardware/calibrate", methods=["POST"])
+def hardware_set_calibration():
+    """
+    Set calibration parameters for a specific sensor on a device.
+    calibrated_value = (raw_value * scale_factor) + offset
+
+    Body:
+    {
+        "device_id": "ESP32-001",
+        "sensor": "air_temp",
+        "offset": -0.5,
+        "scale_factor": 1.02
+    }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        device_id = body.get("device_id", "ESP32-001")
+        sensor = body.get("sensor")
+        offset = body.get("offset", 0.0)
+        scale_factor = body.get("scale_factor", 1.0)
+
+        if not sensor:
+            return jsonify({"error": "Missing sensor parameter"}), 400
+
+        profile = _calibration.set_calibration(
+            device_id=device_id,
+            sensor=sensor,
+            offset=offset,
+            scale_factor=scale_factor,
+        )
+
+        return jsonify({
+            "status": "calibrated",
+            "device_id": device_id,
+            "sensor": sensor,
+            "calibration": profile,
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/hardware/calibrate/reset", methods=["POST"])
+def hardware_reset_calibration():
+    """
+    Reset calibration for a sensor or entire device.
+    Body:
+    {
+        "device_id": "ESP32-001",
+        "sensor": "air_temp"   // optional — if omitted, resets all sensors for device
+    }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        device_id = body.get("device_id", "ESP32-001")
+        sensor = body.get("sensor")  # None = reset all
+
+        _calibration.reset_calibration(device_id, sensor)
+
+        return jsonify({
+            "status": "reset",
+            "device_id": device_id,
+            "sensor": sensor or "all",
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# Session Save & Export Endpoints
+# ============================================================
+
+@app.route("/session/save", methods=["POST"])
+def session_save():
+    """
+    Export entire simulation/hardware session as JSON and human-readable report.
+
+    Body (optional):
+    {
+        "source": "simulator" | "hardware",   // default: "simulator"
+        "format": "json" | "report" | "both", // default: "both"
+        "include_replay": true                 // include decision replay data
+    }
+
+    Returns: JSON with session data and/or report text.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        source = body.get("source", "simulator")
+        output_format = body.get("format", "both")
+        include_replay = body.get("include_replay", True)
+
+        if source == "hardware":
+            history = _hardware_store.get_history()
+            device_status = _hardware_store.get_device_status()
+            source_label = "Hardware (ESP32)"
+        else:
+            history = _simulator.get_history()
+            device_status = None
+            source_label = "Simulator"
+
+        if not history:
+            return jsonify({"error": f"No {source} history available. Run some steps first."}), 404
+
+        # Build session metadata
+        first_entry = history[0]
+        last_entry = history[-1]
+
+        session_meta = {
+            "source": source,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "total_steps": len(history),
+            "time_span": {
+                "start": first_entry.get("sim_time") or first_entry.get("timestamp", ""),
+                "end": last_entry.get("sim_time") or last_entry.get("timestamp", ""),
+            },
+            "scenario": first_entry.get("scenario", "N/A"),
+            "plant": first_entry.get("plant", "") or body.get("plant", "unknown"),
+            "growth_stage": first_entry.get("stage", "") or body.get("stage", "unknown"),
+        }
+
+        if device_status:
+            session_meta["device"] = device_status
+
+        # Build timeline
+        timeline = []
+        for h in history:
+            sensors = h.get("sensor_data", {})
+            plant = h.get("plant", {})
+            weather = h.get("weather", {})
+            soil = h.get("soil", {})
+            snap = h.get("analysis_snapshot", {})
+
+            entry = {
+                "time": h.get("sim_time") or h.get("timestamp", ""),
+                "sensor_data": {
+                    "air_temp": sensors.get("air_temp"),
+                    "humidity": sensors.get("humidity"),
+                    "soil_temp": sensors.get("soil_temp"),
+                    "soil_moisture": sensors.get("soil_moisture"),
+                    "light": sensors.get("light"),
+                    "leaf_temp": sensors.get("leaf_temp"),
+                    "leaf_temp_delta": sensors.get("leaf_temp_delta"),
+                },
+                "plant_state": {
+                    "stress": plant.get("stress"),
+                    "growth": plant.get("growth"),
+                    "transpiration": plant.get("transpiration"),
+                    "photosynthesis": plant.get("photosynthesis"),
+                },
+            }
+
+            if weather:
+                entry["weather"] = {
+                    "air_temp": weather.get("air_temp"),
+                    "humidity": weather.get("humidity"),
+                    "wind_speed": weather.get("wind_speed"),
+                    "cloud_cover": weather.get("cloud_cover"),
+                }
+            if soil:
+                entry["soil"] = {
+                    "soil_temp": soil.get("soil_temp"),
+                    "soil_moisture": soil.get("soil_moisture"),
+                }
+
+            if snap:
+                entry["analysis"] = {
+                    "temporal_prediction": snap.get("temporal_prediction"),
+                    "stress_analysis": snap.get("stress_analysis"),
+                    "biology_analysis": snap.get("biology_analysis"),
+                    "recommendations": snap.get("recommendations"),
+                    "confidence": snap.get("confidence"),
+                    "ai_reasoning": snap.get("ai_reasoning"),
+                }
+
+            timeline.append(entry)
+
+        # Build decision replay data
+        decision_replay = None
+        if include_replay and history:
+            # Find entries with analysis snapshots for replay
+            snapshots = [h for h in history if h.get("analysis_snapshot")]
+            if snapshots:
+                decision_replay = []
+                for h in snapshots[-20:]:  # Last 20 decisions
+                    snap = h.get("analysis_snapshot", {})
+                    decision_replay.append({
+                        "time": h.get("sim_time") or h.get("timestamp", ""),
+                        "sensor_data": h.get("sensor_data", {}),
+                        "decision_input": snap.get("decision_input"),
+                        "recommendations": snap.get("recommendations"),
+                        "ai_reasoning": snap.get("ai_reasoning"),
+                        "confidence": snap.get("confidence"),
+                    })
+
+        session_data = {
+            "session_metadata": session_meta,
+            "timeline": timeline,
+            "decision_replay": decision_replay,
+        }
+
+        result = {}
+
+        if output_format in ("json", "both"):
+            result["json"] = session_data
+
+        if output_format in ("report", "both"):
+            # Generate human-readable report
+            report_lines = []
+            report_lines.append("=" * 70)
+            report_lines.append("ALETHEIA DIGITAL TWIN — SESSION REPORT")
+            report_lines.append("=" * 70)
+            report_lines.append(f"Source:        {source_label}")
+            report_lines.append(f"Exported:      {session_meta['exported_at']}")
+            report_lines.append(f"Plant:         {session_meta['plant']}")
+            report_lines.append(f"Growth Stage:  {session_meta['growth_stage']}")
+            report_lines.append(f"Scenario:      {session_meta['scenario']}")
+            report_lines.append(f"Time Span:     {session_meta['time_span']['start']} → {session_meta['time_span']['end']}")
+            report_lines.append(f"Total Steps:   {session_meta['total_steps']}")
+            report_lines.append("")
+
+            if device_status:
+                report_lines.append("--- DEVICE STATUS ---")
+                report_lines.append(f"Device ID:       {device_status.get('device_id', 'N/A')}")
+                report_lines.append(f"Online:          {device_status.get('online', False)}")
+                report_lines.append(f"Last Packet:     {device_status.get('last_packet_time', 'N/A')}")
+                report_lines.append(f"Sampling Rate:   {device_status.get('sampling_rate_hz', 'N/A')} Hz")
+                report_lines.append(f"Firmware:        {device_status.get('firmware_version', 'N/A')}")
+                report_lines.append("")
+
+            # Sensor summary
+            if timeline:
+                first_s = timeline[0]["sensor_data"]
+                last_s = timeline[-1]["sensor_data"]
+                report_lines.append("--- SENSOR SUMMARY ---")
+                for key in ["air_temp", "humidity", "soil_temp", "soil_moisture", "light", "leaf_temp", "leaf_temp_delta"]:
+                    v0 = first_s.get(key, "N/A")
+                    v1 = last_s.get(key, "N/A")
+                    if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                        delta = round(v1 - v0, 2)
+                        report_lines.append(f"  {key:20s}: {v0:>8} → {v1:>8}  (Δ={delta:+.2f})")
+                    else:
+                        report_lines.append(f"  {key:20s}: {v0} → {v1}")
+                report_lines.append("")
+
+            # Plant state summary
+            if timeline:
+                first_p = timeline[0].get("plant_state", {})
+                last_p = timeline[-1].get("plant_state", {})
+                report_lines.append("--- PLANT STATE SUMMARY ---")
+                for key in ["stress", "growth", "transpiration", "photosynthesis"]:
+                    v0 = first_p.get(key, "N/A")
+                    v1 = last_p.get(key, "N/A")
+                    if isinstance(v0, (int, float)) and isinstance(v1, (int, float)):
+                        delta = round(v1 - v0, 2)
+                        report_lines.append(f"  {key:20s}: {v0:>8.4f} → {v1:>8.4f}  (Δ={delta:+.4f})")
+                    else:
+                        report_lines.append(f"  {key:20s}: {v0} → {v1}")
+                report_lines.append("")
+
+            # AI recommendations summary
+            all_recs = set()
+            for h in history:
+                snap = h.get("analysis_snapshot", {})
+                recs = snap.get("recommendations", [])
+                if isinstance(recs, list):
+                    for r in recs:
+                        all_recs.add(str(r))
+            if all_recs:
+                report_lines.append("--- AI RECOMMENDATIONS ---")
+                for i, rec in enumerate(sorted(all_recs), 1):
+                    report_lines.append(f"  {i}. {rec}")
+                report_lines.append("")
+
+            # Decision replay summary
+            if decision_replay:
+                report_lines.append("--- DECISION REPLAY (Last 20) ---")
+                for i, dr in enumerate(decision_replay, 1):
+                    report_lines.append(f"  Decision #{i} at {dr['time']}")
+                    report_lines.append(f"    Confidence: {dr.get('confidence', 'N/A')}")
+                    recs = dr.get("recommendations", [])
+                    if isinstance(recs, list) and recs:
+                        report_lines.append(f"    Top Recommendation: {recs[0]}")
+                    report_lines.append("")
+
+            report_lines.append("=" * 70)
+            report_lines.append("END OF REPORT")
+            report_lines.append("=" * 70)
+
+            result["report"] = "\n".join(report_lines)
+
+        return jsonify(result)
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/session/export", methods=["GET"])
+def session_export():
+    """
+    Quick export — same as /session/save with defaults (simulator, both formats).
+    Query params:
+        ?source=hardware   (optional, default: simulator)
+        ?format=json       (optional, default: both)
+    """
+    source = request.args.get("source", default="simulator", type=str)
+    output_format = request.args.get("format", default="both", type=str)
+
+    # Re-use session_save logic via internal call
+    with app.test_request_context(
+        method="POST",
+        path="/session/save",
+        json={"source": source, "format": output_format, "include_replay": True},
+    ):
+        return session_save()
 
 
 if __name__ == "__main__":

@@ -676,10 +676,13 @@ class GreenhouseSimulator:
 
     # ----- Step -----
 
-    def step(self, dt_minutes: float = None) -> Dict:
+    def step(self, dt_minutes: float = None, analysis: Dict = None) -> Dict:
         """
         Advance the simulation by dt_minutes (default: speed * 1 real second).
         Returns complete state dict including sensor_data for /analyze.
+
+        If 'analysis' is provided (from run_unified_pipeline), it is attached
+        to the history entry as a snapshot for later comparison/replay.
         """
         if dt_minutes is None:
             dt_minutes = self.speed  # one real second = speed sim-minutes
@@ -767,12 +770,24 @@ class GreenhouseSimulator:
             },
         }
 
-        # 7. Store in history
+        # 7. Attach analysis snapshot if provided (for historical comparison)
+        if analysis:
+            state["analysis_snapshot"] = {
+                "temporal_prediction": analysis.get("temporal_prediction"),
+                "stress_analysis": analysis.get("stress_analysis"),
+                "biology_analysis": analysis.get("biology_analysis"),
+                "recommendations": analysis.get("recommendations"),
+                "confidence": analysis.get("confidence"),
+                "ai_reasoning": analysis.get("ai_reasoning"),
+                "decision_input": analysis.get("decision_input"),
+            }
+
+        # 8. Store in history
         self.history.append(state)
         if len(self.history) > self.max_history:
             self.history = self.history[-self.max_history:]
 
-        # 8. Track scenario elapsed time
+        # 9. Track scenario elapsed time
         self.scenario_elapsed += dt_minutes
 
         return state

@@ -1,7 +1,10 @@
 
 import os
 import traceback
+import logging
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load .env relative to this file's directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,16 +48,16 @@ def _get_client():
             continue
 
         if not api_key:
-            print(f"[Tavily] Key env var '{env_var}' not set, skipping")
+            logger.warning(f"Key env var '{env_var}' not set, skipping")
             _current_key_index += 1
             continue
 
         try:
             _client = TavilyClient(api_key=api_key)
-            print(f"[Tavily] Using key: {env_var}")
+            logger.info(f"Using key: {env_var}")
             return _client
         except Exception as e:
-            print(f"[Tavily] Failed to init client with {env_var}: {e}")
+            logger.error(f"Failed to init client with {env_var}: {e}")
             _current_key_index += 1
 
     raise ValueError("All Tavily API keys exhausted or unavailable")
@@ -66,7 +69,7 @@ def _mark_key_exhausted():
     idx = _current_key_index % len(_KEY_POOL)
     env_var = _KEY_POOL[idx]
     _exhausted_keys.add(env_var)
-    print(f"[Tavily] Marked {env_var} as EXHAUSTED")
+    logger.warning(f"Marked {env_var} as EXHAUSTED")
     _client = None
     _current_key_index += 1
 
@@ -92,12 +95,12 @@ def search_plant_tavily(plant_name):
                 search_depth="advanced",
                 max_results=8
             )
-            print("[Tavily] SUCCESS")
+            logger.info("SUCCESS")
             return response
 
         except Exception as e:
             error_msg = str(e).lower()
-            print(f"[Tavily] ERROR: {e}")
+            logger.error(f"ERROR: {e}")
 
             # Check if this is a usage-limit / rate-limit error
             is_usage_error = any(kw in error_msg for kw in [
@@ -107,7 +110,7 @@ def search_plant_tavily(plant_name):
 
             if is_usage_error:
                 _mark_key_exhausted()
-                print(f"[Tavily] Rotating to next key (attempt {attempt + 1}/{len(_KEY_POOL)})")
+                logger.warning(f"Rotating to next key (attempt {attempt + 1}/{len(_KEY_POOL)})")
                 continue  # try next key
             else:
                 # Not a usage error — don't rotate, just fail
@@ -115,6 +118,6 @@ def search_plant_tavily(plant_name):
                 return None
 
     # All keys exhausted
-    print("[Tavily] ALL KEYS EXHAUSTED — returning None")
+    logger.error("ALL KEYS EXHAUSTED — returning None")
     return None
 

@@ -1,12 +1,58 @@
-venv/
-**pycache**/
+# Python
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
 .env
+
+# Environment files (contains secrets)
+.env
+*.env
+!.env.example
+
+# Node.js / Frontend
+node_modules/
+.next/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.pid
+
+# Build outputs
+frontend/.next/
+
+# Data files generated at runtime
+backend/hardware/calibration.json
+backend/hardware/hardware_history.json
+backend/ai_reasoning_cache.json
+
+# Jupyter
 .ipynb_checkpoints/
 
-
-
-
-
-
-
+# Docker
+.dockerignore

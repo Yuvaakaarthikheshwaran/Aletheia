@@ -12,6 +12,9 @@ import sys
 import os
 import traceback
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Ensure ai/ is importable
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +33,8 @@ from backend.tavily_search import search_plant_tavily
 from backend.parser_extractor import parse_plant_data
 from backend.openrouter_extractor import extract_with_openrouter
 from backend.plant_profile_schema import DEFAULT_PROFILE
+from backend.ai_reasoning_cache import get_cached_ai_reasoning, store_ai_reasoning
+import hashlib
 
 
 def _get_or_fetch_plant_profile(plant_name: str) -> dict:
@@ -53,7 +58,7 @@ def _get_or_fetch_plant_profile(plant_name: str) -> dict:
                 store_plant(plant_key, profile)
                 return profile
     except Exception as e:
-        print(f"[Pipeline] Tavily/Parser fallback triggered: {e}")
+        logger.warning(f"Tavily/Parser fallback triggered: {e}")
         traceback.print_exc()
 
     # 3. Fallback to default profile
@@ -242,7 +247,7 @@ Return STRICT JSON only:
                 repaired = raw.rstrip(",\n\r\t ") + ("}" * open_braces)
                 try:
                     result = json.loads(repaired)
-                    print("[Pipeline] OpenRouter JSON repaired (truncated response)")
+                    logger.info("OpenRouter JSON repaired (truncated response)")
                     return result
                 except json.JSONDecodeError:
                     pass
@@ -263,12 +268,12 @@ Return STRICT JSON only:
                 partial.setdefault("recommendations", ["Monitor sensor readings closely"])
                 partial.setdefault("confidence_narrative", "Confidence reduced due to truncated AI response.")
                 partial["_partial"] = True
-                print("[Pipeline] OpenRouter partial extraction succeeded")
+                logger.info("OpenRouter partial extraction succeeded")
                 return partial
             raise  # re-raise original error if nothing could be salvaged
 
     except Exception as e:
-        print(f"[Pipeline] OpenRouter fallback triggered: {e}")
+        logger.warning(f"OpenRouter fallback triggered: {e}")
         traceback.print_exc()
         return {
             "explanation": "AI reasoning engine unavailable. Analysis based on sensor data and biological models.",
@@ -373,15 +378,68 @@ def run_unified_pipeline(
     response["confidence"] = confidence
 
     # --- Step 7: OpenRouter AI Reasoning ---
-    ai_reasoning = _call_openrouter_reasoning(
-        plant_name=plant_name,
-        plant_profile=plant_profile,
-        sensor_data=repaired_data,
-        temporal_prediction=temporal_result,
-        biology_analysis=biology_result,
-        stress_analysis=response["stress_analysis"],
-        confidence_scores=confidence,
-    )
+    # Generate a cache key based on core inputs for AI reasoning
+    # Using a simple hash of relevant data to identify unique reasoning contexts
+    reasoning_context_str = json.dumps({
+        "plant": plant_name,
+        "stage": growth_stage,
+        "phase": phase,
+        "sensor_summary": {
+            "air_temp": repaired_data.get("air_temp"),
+            "humidity": repaired_data.get("humidity"),
+            "soil_moisture": repaired_data.get("soil_moisture"),
+            "leaf_temp_delta": repaired_data.get("leaf_temp_delta"),
+        },
+        "temporal_prediction_label": temporal_result.get("future_state", {}).get("future_prediction"),
+        "stress_prediction_label": response["stress_analysis"].get("prediction"),
+    }, sort_keys=True)
+    cache_key = hashlib.md5(reasoning_context_str.encode("utf-8")).hexdigest()
+
+    ai_reasoning = get_cached_ai_reasoning(cache_key)
+    
+    if ai_reasoning:
+        logger.info(f"AI Reasoning cache hit for {cache_key[:8]}...")
+        ai_reasoning["_source"] = "ai_reasoning_cache"
+    else:
+        logger.info(f"AI Reasoning cache miss for {cache_key[:8]}... Calling OpenRouter.")
+        try:
+            ai_reasoning = _call_openrouter_reasoning(
+                plant_name=plant_name,
+                plant_profile=plant_profile,
+                sensor_data=repaired_data,
+                temporal_prediction=temporal_result,
+                biology_analysis=biology_result,
+                stress_analysis=response["stress_analysis"],
+                confidence_scores=confidence,
+            )
+            # If successful, store in cache
+            if ai_reasoning and not ai_reasoning.get("_fallback") and not ai_reasoning.get("_partial"):
+                store_ai_reasoning(cache_key, ai_reasoning)
+        except Exception as e:
+            # Catch any OpenRouter specific errors (e.g., 402 Insufficient Credits)
+            if hasattr(e, 'response') and e.response.status_code == 402:
+                logger.warning(f"OpenRouter API Error (402): {e.response.json().get('error', {}).get('message', 'Insufficient Credits')}")
+                logger.info("Falling back to AI Reasoning cache or generic fallback.")
+                ai_reasoning = get_cached_ai_reasoning(cache_key)
+                if not ai_reasoning:
+                    ai_reasoning = {
+                        "explanation": "AI reasoning engine unavailable (credits exhausted). Analysis based on sensor data and biological models.",
+                        "diagnosis": "Unable to generate AI diagnosis at this time due to API limits.",
+                        "recommendations": [
+                            "Monitor sensor readings closely",
+                            "Check plant for visible stress signs",
+                            "Review biology engine warnings"
+                        ],
+                        "confidence_narrative": "Confidence based on sensor validation and temporal models only; AI reasoning is a fallback.",
+                        "_fallback": True,
+                        "_api_error": True,
+                    }
+                else:
+                    ai_reasoning["_source"] = "ai_reasoning_cache_fallback"
+            else:
+                # Re-raise other unexpected exceptions
+                raise
+
     response["ai_reasoning"] = ai_reasoning
 
     # --- Step 8: Recommendations (merged) ---

@@ -1,7 +1,10 @@
 import os
 import json
 import traceback
+import logging
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load .env relative to this file's directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,7 +36,7 @@ def extract_with_openrouter(plant_name, tavily_results):
     try:
         client = _get_client()
     except Exception as e:
-        print(f"[OpenRouter] Client init failed: {e}")
+        logger.error(f"Client init failed: {e}")
         return None
 
     text = ""
@@ -69,6 +72,6 @@ Data:
         return json.loads(result)
 
     except Exception as e:
-        print(f"[OpenRouter] API call failed: {e}")
+        logger.error(f"API call failed: {e}")
         traceback.print_exc()
         return None

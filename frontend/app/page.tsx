@@ -19,7 +19,7 @@ import {
   Legend,
 } from "recharts";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:5000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 export default function Home() {
   const [query, setQuery] = useState("");
@@ -46,6 +46,21 @@ export default function Home() {
   // --- Prediction Accuracy State ---
   const [accuracyData, setAccuracyData] = useState<any>(null);
   const [accuracyLoading, setAccuracyLoading] = useState(false);
+
+  // --- Comparison Mode State ---
+  const [snapshotList, setSnapshotList] = useState<any[]>([]);
+  const [snapshotMinute, setSnapshotMinute] = useState<number | null>(null);
+  const [compareMinute, setCompareMinute] = useState<number | null>(null);
+  const [compareData, setCompareData] = useState<any>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
+
+  // --- Hardware Integration State ---
+  const [hardwareMode, setHardwareMode] = useState(false);
+  const [deviceStatus, setDeviceStatus] = useState<any>(null);
+  const [hardwareHistory, setHardwareHistory] = useState<any[]>([]);
+  const [calibrationData, setCalibrationData] = useState<any>(null);
+  const [sessionExportLoading, setSessionExportLoading] = useState(false);
+  const [hardwarePacketStatus, setHardwarePacketStatus] = useState<string | null>(null);
 
   // --- Fetch simulator state (scenario list, current state) ---
   const fetchSimState = useCallback(async () => {
@@ -145,6 +160,191 @@ export default function Home() {
     setAccuracyLoading(false);
   }, []);
 
+  // --- Comparison Mode: fetch available snapshots ---
+  const fetchSnapshots = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/simulator/temporal/snapshots?limit=100`);
+      const json = await res.json();
+      setSnapshotList(json.snapshots || []);
+    } catch (err) {
+      console.error("Snapshots fetch error:", err);
+    }
+  }, []);
+
+  // --- Comparison Mode: compare prediction vs actual ---
+  const fetchCompare = useCallback(async (snapMin: number, cmpMin: number) => {
+    setCompareLoading(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/simulator/temporal/compare?snapshot_minute=${snapMin}&compare_minute=${cmpMin}`
+      );
+      const json = await res.json();
+      setCompareData(json);
+    } catch (err) {
+      console.error("Compare fetch error:", err);
+    }
+    setCompareLoading(false);
+  }, []);
+
+  // --- Hardware: fetch device status ---
+  const fetchDeviceStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/hardware/status`);
+      const json = await res.json();
+      setDeviceStatus(json);
+    } catch (err) {
+      console.error("Device status fetch error:", err);
+    }
+  }, []);
+
+  // --- Hardware: fetch history ---
+  const fetchHardwareHistory = useCallback(async (n: number = 60) => {
+    try {
+      const res = await fetch(`${API_BASE}/hardware/history?n=${n}`);
+      const json = await res.json();
+      setHardwareHistory(json.history || []);
+      return json;
+    } catch (err) {
+      console.error("Hardware history fetch error:", err);
+      return null;
+    }
+  }, []);
+
+  // --- Hardware: fetch calibration ---
+  const fetchCalibration = useCallback(async (deviceId: string = "ESP32-001") => {
+    try {
+      const res = await fetch(`${API_BASE}/hardware/calibration?device_id=${deviceId}`);
+      const json = await res.json();
+      setCalibrationData(json);
+    } catch (err) {
+      console.error("Calibration fetch error:", err);
+    }
+  }, []);
+
+  // --- Hardware: send a simulated hardware packet (for testing without ESP32) ---
+  const sendHardwarePacket = useCallback(async () => {
+    setLoading(true);
+    setHardwarePacketStatus(null);
+    try {
+      const now = new Date().toISOString();
+      const res = await fetch(`${API_BASE}/hardware/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timestamp: now,
+          device_id: "ESP32-001",
+          plant: selectedPlant,
+          stage: growthStage,
+          mode: phase,
+          firmware_version: "1.0.0",
+          sensor_data: {
+            air_temp: 31.4 + Math.random() * 2 - 1,
+            humidity: 58.2 + Math.random() * 4 - 2,
+            soil_temp: 28.1 + Math.random() * 1 - 0.5,
+            soil_moisture: 46.8 + Math.random() * 3 - 1.5,
+            light: 18200 + Math.random() * 1000 - 500,
+            leaf_temp: 33.5 + Math.random() * 2 - 1,
+          },
+        }),
+      });
+      const json = await res.json();
+      if (json.error) {
+        setHardwarePacketStatus(`Rejected: ${json.message}`);
+        setError(json.message);
+      } else {
+        setHardwarePacketStatus(`Accepted — ${json.device_id}`);
+        // Merge analysis into data display
+        setData({
+          ...json.analysis,
+          _source: "hardware",
+          _device_id: json.device_id,
+        });
+        // Refresh device status and history
+        fetchDeviceStatus();
+        fetchHardwareHistory();
+      }
+    } catch (err: any) {
+      setHardwarePacketStatus(`Error: ${err.message}`);
+      console.error("Hardware packet error:", err);
+    }
+    setLoading(false);
+  }, [selectedPlant, growthStage, phase, fetchDeviceStatus, fetchHardwareHistory]);
+
+  // --- Session: save/export ---
+  const saveSession = useCallback(async (source: string = "simulator", format: string = "both") => {
+    setSessionExportLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/session/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, format, include_replay: true }),
+      });
+      const json = await res.json();
+      if (json.error) {
+        setError(json.error);
+      } else {
+        // Trigger download of the JSON
+        if (json.json) {
+          const blob = new Blob([JSON.stringify(json.json, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `aletheia-session-${source}-${new Date().toISOString().slice(0, 10)}.json`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+        // Trigger download of the report
+        if (json.report) {
+          const blob = new Blob([json.report], { type: "text/plain" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `aletheia-report-${source}-${new Date().toISOString().slice(0, 10)}.txt`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+        setHardwarePacketStatus(`Session exported (${source})`);
+      }
+    } catch (err: any) {
+      console.error("Session save error:", err);
+      setError(err.message);
+    }
+    setSessionExportLoading(false);
+  }, []);
+
+  // --- Hardware: set calibration ---
+  const setCalibration = useCallback(async (deviceId: string, sensor: string, offset: number, scaleFactor: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/hardware/calibrate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, sensor, offset, scale_factor: scaleFactor }),
+      });
+      const json = await res.json();
+      if (json.status === "calibrated") {
+        fetchCalibration(deviceId);
+      }
+      return json;
+    } catch (err) {
+      console.error("Calibration set error:", err);
+      return null;
+    }
+  }, [fetchCalibration]);
+
+  // --- Hardware: reset calibration ---
+  const resetCalibration = useCallback(async (deviceId: string, sensor?: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/hardware/calibrate/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, sensor: sensor || undefined }),
+      });
+      await fetchCalibration(deviceId);
+    } catch (err) {
+      console.error("Calibration reset error:", err);
+    }
+  }, [fetchCalibration]);
+
   // Initial load
   useEffect(() => {
     fetchSimState();
@@ -159,6 +359,27 @@ export default function Home() {
     }, 3000);
     return () => clearInterval(interval);
   }, [liveMode, simRunning, analyze]);
+
+  // Hardware polling: fetch device status when in hardware mode
+  useEffect(() => {
+    if (!hardwareMode) return;
+    fetchDeviceStatus();
+    fetchHardwareHistory();
+    fetchCalibration();
+    const interval = setInterval(() => {
+      fetchDeviceStatus();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [hardwareMode, fetchDeviceStatus, fetchHardwareHistory, fetchCalibration]);
+
+  // Hardware live stream: auto-send packets when in hardware live mode
+  useEffect(() => {
+    if (!hardwareMode || !liveMode) return;
+    const interval = setInterval(() => {
+      sendHardwarePacket();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [hardwareMode, liveMode, sendHardwarePacket]);
 
   // --- Data extraction from unified response ---
   const sensor = data?.sensor_validation?.repaired_data || data?._simulator?.sensor_data;
@@ -270,12 +491,21 @@ export default function Home() {
           Autonomous Plant Intelligence System — Digital Twin
         </p>
 
-        <div className="flex gap-6 mb-6">
+        <div className="flex gap-6 mb-6 flex-wrap">
           <div className="text-green-400">● Backend Online</div>
           <div className="text-green-400">● AI Active</div>
           <div className="text-green-400">● Biology Active</div>
           {data && <div className="text-green-400">● Pipeline Live</div>}
-          {simRunning && <div className="text-blue-400">● Simulator Running</div>}
+          {simRunning && !hardwareMode && <div className="text-blue-400">● Simulator Running</div>}
+          {hardwareMode && <div className="text-purple-400">● Hardware Mode</div>}
+          {hardwareMode && deviceStatus && (
+            <div className={deviceStatus.online ? "text-green-400" : "text-red-400"}>
+              ● Device {deviceStatus.online ? "Online" : "Offline"}
+            </div>
+          )}
+          {hardwarePacketStatus && (
+            <div className="text-yellow-400 text-sm">● {hardwarePacketStatus}</div>
+          )}
         </div>
 
         {/* ============================================================ */}
@@ -356,13 +586,30 @@ export default function Home() {
               {liveMode ? "⏹ Live ON" : "▶ Live OFF"}
             </button>
 
-            {/* Manual Step */}
+            {/* Mode Toggle */}
             <button
-              onClick={analyze}
-              disabled={loading}
-              className="bg-purple-600 hover:bg-purple-500 rounded-xl py-3 font-bold transition disabled:opacity-50"
+              onClick={() => {
+                setHardwareMode(!hardwareMode);
+                if (!hardwareMode) {
+                  fetchDeviceStatus();
+                  fetchHardwareHistory();
+                  fetchCalibration();
+                }
+              }}
+              className={`rounded-xl py-3 font-bold transition ${
+                hardwareMode ? "bg-purple-600 hover:bg-purple-500" : "bg-gray-600 hover:bg-gray-500"
+              }`}
             >
-              {loading ? "..." : "⏭ Step"}
+              {hardwareMode ? "🔌 HW Mode" : "🖥 Sim Mode"}
+            </button>
+
+            {/* Save Session */}
+            <button
+              onClick={() => saveSession(hardwareMode ? "hardware" : "simulator", "both")}
+              disabled={sessionExportLoading}
+              className="bg-indigo-600 hover:bg-indigo-500 rounded-xl py-3 font-bold transition disabled:opacity-50"
+            >
+              {sessionExportLoading ? "..." : "💾 Save"}
             </button>
           </div>
 
@@ -396,6 +643,183 @@ export default function Home() {
             </div>
           </div>
         </div>
+
+        {/* ============================================================ */}
+        {/* HARDWARE DEVICE STATUS PANEL */}
+        {/* ============================================================ */}
+        {hardwareMode && (
+          <div className="bg-white/5 backdrop-blur-xl border border-purple-500/20 rounded-3xl p-6 mb-8">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-2xl text-purple-300">🔌 Hardware Device Panel</h2>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => { fetchDeviceStatus(); fetchHardwareHistory(); fetchCalibration(); }}
+                  className="bg-white/10 hover:bg-white/20 rounded-xl px-4 py-2 text-sm transition"
+                >
+                  🔄 Refresh
+                </button>
+                <button
+                  onClick={() => {
+                    setHardwareMode(false);
+                    setDeviceStatus(null);
+                    setHardwareHistory([]);
+                    setCalibrationData(null);
+                    setHardwarePacketStatus(null);
+                  }}
+                  className="bg-red-600/50 hover:bg-red-500 rounded-xl px-4 py-2 text-sm transition"
+                >
+                  ⏏ Disconnect
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-6 gap-4 mb-4">
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Device ID</span>
+                <p className="text-white font-mono">{deviceStatus?.device_id || "ESP32-001"}</p>
+              </div>
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Connection</span>
+                <p className={deviceStatus?.online ? "text-green-400" : "text-red-400"}>
+                  {deviceStatus?.online ? "● Online" : "● Offline"}
+                </p>
+              </div>
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Last Packet</span>
+                <p className="text-white">{deviceStatus?.last_packet_time || "—"}</p>
+              </div>
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Packet Age</span>
+                <p className={deviceStatus?.online ? "text-green-400" : "text-red-400"}>
+                  {deviceStatus?.packet_age_seconds != null ? `${deviceStatus.packet_age_seconds}s` : "—"}
+                </p>
+              </div>
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Sampling Rate</span>
+                <p className="text-white">{deviceStatus?.sampling_rate_hz?.toFixed(2) || "—"} Hz</p>
+              </div>
+              <div className="bg-black/20 rounded-xl p-3">
+                <span className="text-gray-400 text-xs">Firmware</span>
+                <p className="text-white font-mono">{deviceStatus?.firmware_version || "—"}</p>
+              </div>
+            </div>
+
+            {/* Live Sensor Readings */}
+            {hardwareHistory.length > 0 && (
+              <div className="grid grid-cols-6 gap-4">
+                {(() => {
+                  const last = hardwareHistory[hardwareHistory.length - 1];
+                  const sd = last?.sensor_data || {};
+                  return (
+                    <>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Air Temp</span>
+                        <p className="text-white">{sd.air_temp?.toFixed(1) || "—"}°C</p>
+                      </div>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Humidity</span>
+                        <p className="text-white">{sd.humidity?.toFixed(1) || "—"}%</p>
+                      </div>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Soil Temp</span>
+                        <p className="text-white">{sd.soil_temp?.toFixed(1) || "—"}°C</p>
+                      </div>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Soil Moisture</span>
+                        <p className="text-white">{sd.soil_moisture?.toFixed(1) || "—"}%</p>
+                      </div>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Light</span>
+                        <p className="text-white">{sd.light?.toFixed(0) || "—"} lux</p>
+                      </div>
+                      <div className="bg-black/20 rounded-xl p-3">
+                        <span className="text-gray-400 text-xs">Leaf Temp</span>
+                        <p className="text-white">{sd.leaf_temp?.toFixed(1) || "—"}°C</p>
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Packet Count */}
+            <div className="mt-4 text-gray-500 text-xs">
+              Total packets received: {hardwareHistory.length}
+              {deviceStatus?.packet_count != null && ` (server: ${deviceStatus.packet_count})`}
+            </div>
+          </div>
+        )}
+
+        {/* ============================================================ */}
+        {/* HARDWARE CALIBRATION PANEL */}
+        {/* ============================================================ */}
+        {hardwareMode && calibrationData && (
+          <div className="bg-white/5 backdrop-blur-xl border border-purple-500/20 rounded-3xl p-6 mb-8">
+            <h2 className="text-2xl text-purple-300 mb-4">📐 Sensor Calibration</h2>
+            <div className="grid grid-cols-6 gap-4">
+              {["air_temp", "humidity", "soil_temp", "soil_moisture", "light", "leaf_temp"].map((sensor) => {
+                const cal = calibrationData?.sensors?.[sensor] || { offset: 0, scale_factor: 1, status: "none" };
+                const sensorLabels: Record<string, string> = {
+                  air_temp: "Air Temp", humidity: "Humidity", soil_temp: "Soil Temp",
+                  soil_moisture: "Soil Moisture", light: "Light", leaf_temp: "Leaf Temp"
+                };
+                const sensorUnits: Record<string, string> = {
+                  air_temp: "°C", humidity: "%", soil_temp: "°C",
+                  soil_moisture: "%", light: "lux", leaf_temp: "°C"
+                };
+                return (
+                  <div key={sensor} className="bg-black/20 rounded-xl p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-gray-400 text-xs">{sensorLabels[sensor]}</span>
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        cal.status === "calibrated" ? "bg-green-500/20 text-green-400" :
+                        cal.status === "none" ? "bg-gray-500/20 text-gray-400" : "bg-yellow-500/20 text-yellow-400"
+                      }`}>
+                        {cal.status || "none"}
+                      </span>
+                    </div>
+                    <div className="space-y-1 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Offset</span>
+                        <span className="text-white">{cal.offset?.toFixed(2) || "0.00"} {sensorUnits[sensor]}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">Scale</span>
+                        <span className="text-white">{cal.scale_factor?.toFixed(3) || "1.000"}×</span>
+                      </div>
+                      {cal.calibrated_at && (
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">Calibrated</span>
+                          <span className="text-white text-[10px]">{cal.calibrated_at}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex gap-1 mt-2">
+                      <button
+                        onClick={() => {
+                          const offset = parseFloat(prompt(`Offset for ${sensorLabels[sensor]} (${sensorUnits[sensor]}):`, "0") || "0");
+                          const scale = parseFloat(prompt(`Scale factor for ${sensorLabels[sensor]}:`, "1") || "1");
+                          if (!isNaN(offset) && !isNaN(scale)) {
+                            setCalibration("ESP32-001", sensor, offset, scale);
+                          }
+                        }}
+                        className="bg-purple-600/50 hover:bg-purple-500 text-xs rounded-lg px-2 py-1 transition flex-1"
+                      >
+                        Set
+                      </button>
+                      <button
+                        onClick={() => resetCalibration("ESP32-001", sensor)}
+                        className="bg-red-600/30 hover:bg-red-500/50 text-xs rounded-lg px-2 py-1 transition"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* ============================================================ */}
         {/* PLANT SELECTION */}
@@ -1211,6 +1635,288 @@ export default function Home() {
                           ))}
                         </tbody>
                       </table>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* ============================================================ */}
+            {/* COMPARISON MODE — Prediction vs Actual at any historical point */}
+            {/* ============================================================ */}
+            <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
+              <h2 className="text-3xl mb-2">Comparison Mode</h2>
+              <p className="text-gray-400 text-sm mb-6">
+                Select any historical prediction snapshot and compare what Aletheia
+                predicted with what actually happened at that future time.
+                <br />
+                <span className="text-green-400">
+                  Prediction → Actual → Error → Reason
+                </span>
+              </p>
+
+              {/* Load Snapshots Button */}
+              {snapshotList.length === 0 && (
+                <button
+                  onClick={fetchSnapshots}
+                  className="bg-purple-600 hover:bg-purple-500 rounded-xl px-6 py-3 font-bold transition mb-6"
+                >
+                  Load Historical Snapshots
+                </button>
+              )}
+
+              {/* Snapshot Selector */}
+              {snapshotList.length > 0 && (
+                <>
+                  <div className="grid grid-cols-2 gap-4 mb-6">
+                    <div>
+                      <label className="text-gray-400 text-sm mb-2 block">
+                        Prediction Snapshot (when Aletheia made the prediction)
+                      </label>
+                      <select
+                        value={snapshotMinute ?? ""}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value);
+                          setSnapshotMinute(v);
+                          // Auto-set compare minute to snapshot + 30
+                          setCompareMinute(v + 30);
+                        }}
+                        className="w-full bg-black/30 border border-gray-600 rounded-xl px-4 py-3 text-white"
+                      >
+                        <option value="">Select a snapshot...</option>
+                        {snapshotList.map((s: any) => (
+                          <option key={s.sim_minute} value={s.sim_minute}>
+                            {s.sim_time} (min {s.sim_minute}) — Temporal:{" "}
+                            {s.temporal_prediction?.future_state?.future_prediction || "N/A"}
+                            {" | "}Stress: {s.stress_analysis?.prediction || "N/A"}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-gray-400 text-sm mb-2 block">
+                        Compare Against (when to check what actually happened)
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          type="number"
+                          value={compareMinute ?? ""}
+                          onChange={(e) => setCompareMinute(parseInt(e.target.value) || null)}
+                          className="flex-1 bg-black/30 border border-gray-600 rounded-xl px-4 py-3 text-white"
+                          placeholder="e.g. 755"
+                        />
+                        <button
+                          onClick={() => {
+                            if (snapshotMinute !== null && compareMinute !== null) {
+                              fetchCompare(snapshotMinute, compareMinute);
+                            }
+                          }}
+                          disabled={snapshotMinute === null || compareMinute === null || compareLoading}
+                          className="bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl px-6 py-3 font-bold transition"
+                        >
+                          {compareLoading ? "Comparing..." : "Compare"}
+                        </button>
+                      </div>
+                      {/* Quick offset buttons */}
+                      <div className="flex gap-2 mt-2">
+                        {[5, 10, 15, 20, 30, 60].map((offset) => (
+                          <button
+                            key={offset}
+                            onClick={() => {
+                              if (snapshotMinute !== null) {
+                                const cmp = snapshotMinute + offset;
+                                setCompareMinute(cmp);
+                                fetchCompare(snapshotMinute, cmp);
+                              }
+                            }}
+                            disabled={snapshotMinute === null}
+                            className="bg-black/30 hover:bg-purple-600/50 border border-gray-600 rounded-lg px-3 py-1 text-xs text-gray-300 transition"
+                          >
+                            +{offset}m
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Comparison Results */}
+                  {compareData && !compareLoading && (
+                    <div className="space-y-6">
+                      {/* Verdict Banner */}
+                      <div
+                        className={`rounded-2xl p-6 text-center ${
+                          compareData.comparison?.prediction_correct
+                            ? "bg-green-500/10 border border-green-500/30"
+                            : "bg-red-500/10 border border-red-500/30"
+                        }`}
+                      >
+                        <p className="text-2xl font-bold">
+                          {compareData.comparison?.prediction_correct ? (
+                            <span className="text-green-400">✓ Prediction CORRECT</span>
+                          ) : (
+                            <span className="text-red-400">✗ Prediction INCORRECT</span>
+                          )}
+                        </p>
+                        <p className="text-gray-400 mt-2">
+                          At {compareData.snapshot?.sim_time}, Aletheia predicted{" "}
+                          <span className="text-blue-300 font-bold">
+                            {compareData.comparison?.predicted_label}
+                          </span>
+                          {" → "}
+                          At {compareData.actual?.sim_time} (
+                          {compareData.comparison?.time_delta_minutes}m later), reality was{" "}
+                          <span className="text-yellow-300 font-bold">
+                            {compareData.comparison?.actual_label}
+                          </span>
+                        </p>
+                        <p className="text-3xl mt-3 font-bold">
+                          Overall Accuracy:{" "}
+                          <span
+                            className={
+                              (compareData.comparison?.overall_accuracy ?? 0) >= 90
+                                ? "text-green-400"
+                                : (compareData.comparison?.overall_accuracy ?? 0) >= 70
+                                ? "text-yellow-400"
+                                : "text-red-400"
+                            }
+                          >
+                            {compareData.comparison?.overall_accuracy?.toFixed(1)}%
+                          </span>
+                        </p>
+                      </div>
+
+                      {/* Per-Variable Comparison Table */}
+                      <div className="bg-black/20 rounded-2xl p-6">
+                        <h3 className="text-lg text-gray-300 mb-4">
+                          Variable-by-Variable Comparison
+                        </h3>
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-gray-500 border-b border-gray-700">
+                              <th className="text-left py-2">Variable</th>
+                              <th className="text-right py-2">Predicted</th>
+                              <th className="text-right py-2">Actual</th>
+                              <th className="text-right py-2">Error</th>
+                              <th className="text-right py-2">Error %</th>
+                              <th className="text-right py-2">Accuracy</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {compareData.comparison?.variables?.map((v: any, idx: number) => (
+                              <tr key={idx} className="border-b border-gray-800">
+                                <td className="py-2 text-gray-300 font-medium">
+                                  {v.variable.replaceAll("_", " ").toUpperCase()}
+                                </td>
+                                <td className="py-2 text-right text-blue-300">
+                                  {v.predicted?.toFixed(2)}
+                                </td>
+                                <td className="py-2 text-right text-green-300">
+                                  {v.actual?.toFixed(2)}
+                                </td>
+                                <td className="py-2 text-right text-gray-400">
+                                  {v.error?.toFixed(2)}
+                                </td>
+                                <td
+                                  className={`py-2 text-right ${
+                                    v.error_pct > 10
+                                      ? "text-red-400"
+                                      : v.error_pct > 5
+                                      ? "text-yellow-400"
+                                      : "text-green-400"
+                                  }`}
+                                >
+                                  {v.error_pct?.toFixed(1)}%
+                                </td>
+                                <td
+                                  className={`py-2 text-right font-bold ${
+                                    v.accuracy >= 90
+                                      ? "text-green-400"
+                                      : v.accuracy >= 70
+                                      ? "text-yellow-400"
+                                      : "text-red-400"
+                                  }`}
+                                >
+                                  {v.accuracy?.toFixed(1)}%
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* Snapshot Context */}
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="bg-black/20 rounded-2xl p-5">
+                          <h3 className="text-blue-400 mb-3">
+                            Snapshot at {compareData.snapshot?.sim_time}
+                          </h3>
+                          <div className="space-y-1 text-xs text-gray-400">
+                            <p>
+                              Temporal:{" "}
+                              <span className="text-blue-300">
+                                {compareData.snapshot?.temporal_prediction?.future_state?.future_prediction || "N/A"}
+                              </span>
+                            </p>
+                            <p>
+                              Stress:{" "}
+                              <span className="text-red-300">
+                                {compareData.snapshot?.stress_analysis?.prediction || "N/A"}
+                              </span>
+                            </p>
+                            <p>
+                              Confidence:{" "}
+                              {compareData.snapshot?.stress_analysis?.confidence || "N/A"}%
+                            </p>
+                            <p>
+                              Recommendations:{" "}
+                              {compareData.snapshot?.recommendations?.length || 0} items
+                            </p>
+                          </div>
+                        </div>
+                        <div className="bg-black/20 rounded-2xl p-5">
+                          <h3 className="text-green-400 mb-3">
+                            Actual at {compareData.actual?.sim_time}
+                          </h3>
+                          <div className="space-y-1 text-xs text-gray-400">
+                            <p>
+                              Air Temp:{" "}
+                              <span className="text-white">
+                                {compareData.actual?.sensor_data?.air_temp?.toFixed(1)}°C
+                              </span>
+                            </p>
+                            <p>
+                              Humidity:{" "}
+                              <span className="text-white">
+                                {compareData.actual?.sensor_data?.humidity?.toFixed(1)}%
+                              </span>
+                            </p>
+                            <p>
+                              Soil Moisture:{" "}
+                              <span className="text-white">
+                                {compareData.actual?.sensor_data?.soil_moisture?.toFixed(1)}%
+                              </span>
+                            </p>
+                            <p>
+                              Leaf ΔT:{" "}
+                              <span className="text-white">
+                                {compareData.actual?.sensor_data?.leaf_temp_delta?.toFixed(2)}°C
+                              </span>
+                            </p>
+                            <p>
+                              Plant Stress:{" "}
+                              <span className="text-white">
+                                {compareData.actual?.plant?.stress?.toFixed(2)}
+                              </span>
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {!compareData && !compareLoading && snapshotMinute !== null && (
+                    <div className="text-center text-gray-500 py-4 text-sm">
+                      Select a compare time and click "Compare" to see prediction vs actual
                     </div>
                   )}
                 </>

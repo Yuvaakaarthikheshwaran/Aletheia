@@ -1,4 +1,12 @@
-Flask
-flask-cors
-dotenv
-tavily-python
+Flask>=3.0
+flask-cors>=4.0
+python-dotenv>=1.0
+openai>=1.0
+RapidFuzz>=3.0
+joblib>=1.0
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.5
+scipy>=1.13
+tavily-python>=0.7
+gunicorn>=23.0
