@@ -1,3 +1,14 @@
+---
+title: Aletheia
+emoji: 🌿
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
+
 # Aletheia — AI-Powered Digital Twin for Intelligent Agriculture
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
