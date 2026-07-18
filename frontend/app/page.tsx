@@ -19,7 +19,90 @@ import {
   Legend,
 } from "recharts";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const RAW_API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+// Normalize: strip trailing slash so we never produce double-slashes like //analyze
+const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
+
+/**
+ * Safe fetch wrapper that:
+ *  - Validates the API_BASE is configured
+ *  - Checks response.ok before parsing JSON
+ *  - Verifies Content-Type is JSON before calling .json()
+ *  - Returns a structured error instead of throwing JSON.parse on HTML
+ */
+async function safeFetch(
+  path: string,
+  options?: RequestInit
+): Promise<{ ok: boolean; data: any; error?: string; status: number; contentType: string }> {
+  if (!API_BASE) {
+    return {
+      ok: false,
+      data: null,
+      status: 0,
+      contentType: "",
+      error: "Backend URL not configured. Set NEXT_PUBLIC_API_URL in Vercel environment variables.",
+    };
+  }
+
+  const url = `${API_BASE}${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, options);
+  } catch (fetchErr: any) {
+    return {
+      ok: false,
+      data: null,
+      status: 0,
+      contentType: "",
+      error: `Network error: ${fetchErr.message || "Failed to reach backend at " + url}`,
+    };
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const status = res.status;
+
+  // Read as text first — never blindly call .json()
+  let rawText = "";
+  try {
+    rawText = await res.text();
+  } catch (textErr: any) {
+    return {
+      ok: false,
+      data: null,
+      status,
+      contentType,
+      error: `Failed to read response body: ${textErr.message}`,
+    };
+  }
+
+  // If the response is not JSON, return the raw text as error context
+  if (!contentType.includes("application/json")) {
+    const preview = rawText.substring(0, 200).replace(/\n/g, " ");
+    return {
+      ok: false,
+      data: null,
+      status,
+      contentType,
+      error: `Backend returned non-JSON response (HTTP ${status}, Content-Type: ${contentType || "unknown"}). Preview: ${preview}...`,
+    };
+  }
+
+  // Try to parse JSON
+  let json: any;
+  try {
+    json = JSON.parse(rawText);
+  } catch (parseErr: any) {
+    return {
+      ok: false,
+      data: null,
+      status,
+      contentType,
+      error: `Failed to parse JSON response (HTTP ${status}): ${parseErr.message}`,
+    };
+  }
+
+  return { ok: res.ok, data: json, status, contentType };
+}
 
 export default function Home() {
   const [query, setQuery] = useState("");
@@ -64,16 +147,14 @@ export default function Home() {
 
   // --- Fetch simulator state (scenario list, current state) ---
   const fetchSimState = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/simulator/state`);
-      const json = await res.json();
-      setSimState(json);
-      if (json.available_scenarios) {
-        setScenarioList(json.available_scenarios);
+    const result = await safeFetch("/simulator/state");
+    if (result.ok && result.data) {
+      setSimState(result.data);
+      if (result.data.available_scenarios) {
+        setScenarioList(result.data.available_scenarios);
       }
-    } catch (err) {
-      // Silently ignore — simulator may not be running yet
     }
+    // Silently ignore errors — simulator may not be running yet
   }, []);
 
   // --- Core analysis: step simulator + run AI pipeline ---
@@ -81,34 +162,36 @@ export default function Home() {
     setLoading(true);
     setError(null);
 
-    try {
-      // Use /simulator/analyze to get both simulator state + AI analysis
-      const res = await fetch(`${API_BASE}/simulator/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          plant: selectedPlant,
-          stage: growthStage,
-          dt_minutes: simSpeed,
-        }),
+    const result = await safeFetch("/simulator/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        plant: selectedPlant,
+        stage: growthStage,
+        dt_minutes: simSpeed,
+      }),
+    });
+
+    if (!result.ok) {
+      setError(result.error || `Backend returned HTTP ${result.status}`);
+      console.error("Analyze error:", result.error, "status:", result.status, "contentType:", result.contentType);
+      setLoading(false);
+      return;
+    }
+
+    const json = result.data;
+    if (json.error) {
+      setError(json.message || json.error);
+    } else {
+      // Merge simulator state + analysis
+      setData({
+        ...json.analysis,
+        _simulator: json.simulator,
       });
-      const json = await res.json();
-      if (json.error) {
-        setError(json.message || json.error);
-      } else {
-        // Merge simulator state + analysis
-        setData({
-          ...json.analysis,
-          _simulator: json.simulator,
-        });
-        setSimState((prev: any) => ({
-          ...prev,
-          ...json.simulator,
-        }));
-      }
-    } catch (err: any) {
-      setError(err.message || "Connection failed");
-      console.error(err);
+      setSimState((prev: any) => ({
+        ...prev,
+        ...json.simulator,
+      }));
     }
 
     setLoading(false);
@@ -116,33 +199,31 @@ export default function Home() {
 
   // --- Simulator controls ---
   const simControl = useCallback(async (action: string, body?: any) => {
-    try {
-      const res = await fetch(`${API_BASE}/simulator/${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      const json = await res.json();
+    const result = await safeFetch(`/simulator/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (result.ok && result.data) {
       if (action === "start") setSimRunning(true);
       if (action === "pause" || action === "reset") setSimRunning(false);
       if (action === "scenario") setSimScenario(body?.scenario || "normal_day");
       if (action === "speed") setSimSpeed(body?.speed || 1.0);
       await fetchSimState();
-    } catch (err) {
-      console.error("Simulator control error:", err);
+    } else {
+      console.error("Simulator control error:", result.error);
     }
   }, [fetchSimState]);
 
   // --- Temporal Replay: fetch state at a specific sim_minute ---
   const fetchReplay = useCallback(async (minute: number, n: number = 10) => {
     setReplayLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/simulator/temporal/replay?minute=${minute}&n=${n}`);
-      const json = await res.json();
-      setReplayData(json);
+    const result = await safeFetch(`/simulator/temporal/replay?minute=${minute}&n=${n}`);
+    if (result.ok && result.data) {
+      setReplayData(result.data);
       setReplayMinute(minute);
-    } catch (err) {
-      console.error("Replay fetch error:", err);
+    } else {
+      console.error("Replay fetch error:", result.error);
     }
     setReplayLoading(false);
   }, []);
@@ -150,74 +231,68 @@ export default function Home() {
   // --- Prediction Accuracy: fetch rolling accuracy ---
   const fetchAccuracy = useCallback(async () => {
     setAccuracyLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/simulator/temporal/accuracy`);
-      const json = await res.json();
-      setAccuracyData(json);
-    } catch (err) {
-      console.error("Accuracy fetch error:", err);
+    const result = await safeFetch("/simulator/temporal/accuracy");
+    if (result.ok && result.data) {
+      setAccuracyData(result.data);
+    } else {
+      console.error("Accuracy fetch error:", result.error);
     }
     setAccuracyLoading(false);
   }, []);
 
   // --- Comparison Mode: fetch available snapshots ---
   const fetchSnapshots = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/simulator/temporal/snapshots?limit=100`);
-      const json = await res.json();
-      setSnapshotList(json.snapshots || []);
-    } catch (err) {
-      console.error("Snapshots fetch error:", err);
+    const result = await safeFetch("/simulator/temporal/snapshots?limit=100");
+    if (result.ok && result.data) {
+      setSnapshotList(result.data.snapshots || []);
+    } else {
+      console.error("Snapshots fetch error:", result.error);
     }
   }, []);
 
   // --- Comparison Mode: compare prediction vs actual ---
   const fetchCompare = useCallback(async (snapMin: number, cmpMin: number) => {
     setCompareLoading(true);
-    try {
-      const res = await fetch(
-        `${API_BASE}/simulator/temporal/compare?snapshot_minute=${snapMin}&compare_minute=${cmpMin}`
-      );
-      const json = await res.json();
-      setCompareData(json);
-    } catch (err) {
-      console.error("Compare fetch error:", err);
+    const result = await safeFetch(
+      `/simulator/temporal/compare?snapshot_minute=${snapMin}&compare_minute=${cmpMin}`
+    );
+    if (result.ok && result.data) {
+      setCompareData(result.data);
+    } else {
+      console.error("Compare fetch error:", result.error);
     }
     setCompareLoading(false);
   }, []);
 
   // --- Hardware: fetch device status ---
   const fetchDeviceStatus = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/hardware/status`);
-      const json = await res.json();
-      setDeviceStatus(json);
-    } catch (err) {
-      console.error("Device status fetch error:", err);
+    const result = await safeFetch("/hardware/status");
+    if (result.ok && result.data) {
+      setDeviceStatus(result.data);
+    } else {
+      console.error("Device status fetch error:", result.error);
     }
   }, []);
 
   // --- Hardware: fetch history ---
   const fetchHardwareHistory = useCallback(async (n: number = 60) => {
-    try {
-      const res = await fetch(`${API_BASE}/hardware/history?n=${n}`);
-      const json = await res.json();
-      setHardwareHistory(json.history || []);
-      return json;
-    } catch (err) {
-      console.error("Hardware history fetch error:", err);
+    const result = await safeFetch(`/hardware/history?n=${n}`);
+    if (result.ok && result.data) {
+      setHardwareHistory(result.data.history || []);
+      return result.data;
+    } else {
+      console.error("Hardware history fetch error:", result.error);
       return null;
     }
   }, []);
 
   // --- Hardware: fetch calibration ---
   const fetchCalibration = useCallback(async (deviceId: string = "ESP32-001") => {
-    try {
-      const res = await fetch(`${API_BASE}/hardware/calibration?device_id=${deviceId}`);
-      const json = await res.json();
-      setCalibrationData(json);
-    } catch (err) {
-      console.error("Calibration fetch error:", err);
+    const result = await safeFetch(`/hardware/calibration?device_id=${deviceId}`);
+    if (result.ok && result.data) {
+      setCalibrationData(result.data);
+    } else {
+      console.error("Calibration fetch error:", result.error);
     }
   }, []);
 
@@ -225,47 +300,51 @@ export default function Home() {
   const sendHardwarePacket = useCallback(async () => {
     setLoading(true);
     setHardwarePacketStatus(null);
-    try {
-      const now = new Date().toISOString();
-      const res = await fetch(`${API_BASE}/hardware/update`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          timestamp: now,
-          device_id: "ESP32-001",
-          plant: selectedPlant,
-          stage: growthStage,
-          mode: phase,
-          firmware_version: "1.0.0",
-          sensor_data: {
-            air_temp: 31.4 + Math.random() * 2 - 1,
-            humidity: 58.2 + Math.random() * 4 - 2,
-            soil_temp: 28.1 + Math.random() * 1 - 0.5,
-            soil_moisture: 46.8 + Math.random() * 3 - 1.5,
-            light: 18200 + Math.random() * 1000 - 500,
-            leaf_temp: 33.5 + Math.random() * 2 - 1,
-          },
-        }),
+    const now = new Date().toISOString();
+    const result = await safeFetch("/hardware/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        timestamp: now,
+        device_id: "ESP32-001",
+        plant: selectedPlant,
+        stage: growthStage,
+        mode: phase,
+        firmware_version: "1.0.0",
+        sensor_data: {
+          air_temp: 31.4 + Math.random() * 2 - 1,
+          humidity: 58.2 + Math.random() * 4 - 2,
+          soil_temp: 28.1 + Math.random() * 1 - 0.5,
+          soil_moisture: 46.8 + Math.random() * 3 - 1.5,
+          light: 18200 + Math.random() * 1000 - 500,
+          leaf_temp: 33.5 + Math.random() * 2 - 1,
+        },
+      }),
+    });
+
+    if (!result.ok) {
+      setHardwarePacketStatus(`Error: ${result.error}`);
+      setError(result.error);
+      console.error("Hardware packet error:", result.error, "status:", result.status);
+      setLoading(false);
+      return;
+    }
+
+    const json = result.data;
+    if (json.error) {
+      setHardwarePacketStatus(`Rejected: ${json.message}`);
+      setError(json.message);
+    } else {
+      setHardwarePacketStatus(`Accepted — ${json.device_id}`);
+      // Merge analysis into data display
+      setData({
+        ...json.analysis,
+        _source: "hardware",
+        _device_id: json.device_id,
       });
-      const json = await res.json();
-      if (json.error) {
-        setHardwarePacketStatus(`Rejected: ${json.message}`);
-        setError(json.message);
-      } else {
-        setHardwarePacketStatus(`Accepted — ${json.device_id}`);
-        // Merge analysis into data display
-        setData({
-          ...json.analysis,
-          _source: "hardware",
-          _device_id: json.device_id,
-        });
-        // Refresh device status and history
-        fetchDeviceStatus();
-        fetchHardwareHistory();
-      }
-    } catch (err: any) {
-      setHardwarePacketStatus(`Error: ${err.message}`);
-      console.error("Hardware packet error:", err);
+      // Refresh device status and history
+      fetchDeviceStatus();
+      fetchHardwareHistory();
     }
     setLoading(false);
   }, [selectedPlant, growthStage, phase, fetchDeviceStatus, fetchHardwareHistory]);
@@ -273,75 +352,77 @@ export default function Home() {
   // --- Session: save/export ---
   const saveSession = useCallback(async (source: string = "simulator", format: string = "both") => {
     setSessionExportLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/session/save`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, format, include_replay: true }),
-      });
-      const json = await res.json();
-      if (json.error) {
-        setError(json.error);
-      } else {
-        // Trigger download of the JSON
-        if (json.json) {
-          const blob = new Blob([JSON.stringify(json.json, null, 2)], { type: "application/json" });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `aletheia-session-${source}-${new Date().toISOString().slice(0, 10)}.json`;
-          a.click();
-          URL.revokeObjectURL(url);
-        }
-        // Trigger download of the report
-        if (json.report) {
-          const blob = new Blob([json.report], { type: "text/plain" });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `aletheia-report-${source}-${new Date().toISOString().slice(0, 10)}.txt`;
-          a.click();
-          URL.revokeObjectURL(url);
-        }
-        setHardwarePacketStatus(`Session exported (${source})`);
+    const result = await safeFetch("/session/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, format, include_replay: true }),
+    });
+
+    if (!result.ok) {
+      setError(result.error || `Session save failed (HTTP ${result.status})`);
+      console.error("Session save error:", result.error);
+      setSessionExportLoading(false);
+      return;
+    }
+
+    const json = result.data;
+    if (json.error) {
+      setError(json.error);
+    } else {
+      // Trigger download of the JSON
+      if (json.json) {
+        const blob = new Blob([JSON.stringify(json.json, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `aletheia-session-${source}-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
       }
-    } catch (err: any) {
-      console.error("Session save error:", err);
-      setError(err.message);
+      // Trigger download of the report
+      if (json.report) {
+        const blob = new Blob([json.report], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `aletheia-report-${source}-${new Date().toISOString().slice(0, 10)}.txt`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+      setHardwarePacketStatus(`Session exported (${source})`);
     }
     setSessionExportLoading(false);
   }, []);
 
   // --- Hardware: set calibration ---
   const setCalibration = useCallback(async (deviceId: string, sensor: string, offset: number, scaleFactor: number) => {
-    try {
-      const res = await fetch(`${API_BASE}/hardware/calibrate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: deviceId, sensor, offset, scale_factor: scaleFactor }),
-      });
-      const json = await res.json();
-      if (json.status === "calibrated") {
+    const result = await safeFetch("/hardware/calibrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId, sensor, offset, scale_factor: scaleFactor }),
+    });
+    if (result.ok && result.data) {
+      if (result.data.status === "calibrated") {
         fetchCalibration(deviceId);
       }
-      return json;
-    } catch (err) {
-      console.error("Calibration set error:", err);
+      return result.data;
+    } else {
+      console.error("Calibration set error:", result.error);
       return null;
     }
   }, [fetchCalibration]);
 
   // --- Hardware: reset calibration ---
   const resetCalibration = useCallback(async (deviceId: string, sensor?: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/hardware/calibrate/reset`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: deviceId, sensor: sensor || undefined }),
-      });
+    const result = await safeFetch("/hardware/calibrate/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId, sensor: sensor || undefined }),
+    });
+    if (result.ok) {
       await fetchCalibration(deviceId);
-    } catch (err) {
-      console.error("Calibration reset error:", err);
+    } else {
+      console.error("Calibration reset error:", result.error);
     }
   }, [fetchCalibration]);
 
