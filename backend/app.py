@@ -745,6 +745,130 @@ def temporal_compare():
 
 
 # ============================================================
+# Temporal AI — Time-Range Historical Data Query
+# ============================================================
+
+@app.route("/simulator/temporal/history", methods=["GET"])
+def temporal_history_range():
+    """
+    Return historical sensor data for a specific time range with intelligent
+    downsampling to avoid sending millions of points to the browser.
+
+    Query params:
+        ?range=24h     — last 24 hours (default)
+        ?range=7d      — last 7 days
+        ?range=30d     — last 30 days
+        ?range=all     — all available history
+        ?from_minute=0 &to_minute=720  — explicit minute range
+        ?variables=air_temp,humidity,soil_moisture,leaf_temp_delta
+
+    Downsampling strategy:
+        24h → every point (1-min resolution, max 1440)
+        7d  → every 5th point (~288 points)
+        30d → every 15th point (~288 points)
+        all → every 30th point
+
+    Each data point includes:
+        sim_time, sim_minute, value, unit, data_type ("observed")
+
+    Returns:
+        series: dict keyed by variable name, each containing data points
+        range: the time range covered
+        total_raw_points: count before downsampling
+        total_returned_points: count after downsampling
+    """
+    range_param = request.args.get("range", default="24h")
+    from_minute = request.args.get("from_minute", default=None, type=int)
+    to_minute = request.args.get("to_minute", default=None, type=int)
+    variables_str = request.args.get(
+        "variables",
+        default="air_temp,humidity,soil_moisture,leaf_temp_delta,light,soil_temp,stress,growth"
+    )
+    variables = [v.strip() for v in variables_str.split(",")]
+
+    history = _simulator.get_history()
+    if not history:
+        return jsonify({"error": "No simulation history available", "series": {}, "range": range_param}), 200
+
+    # Determine time range
+    total_minutes = len(history)
+    if from_minute is not None and to_minute is not None:
+        # Explicit range
+        filtered = [h for h in history if from_minute <= h.get("sim_minute", 0) <= to_minute]
+    elif range_param == "all":
+        filtered = list(history)
+    elif range_param == "30d":
+        n = min(total_minutes, 43200)  # 30 days of minute data
+        filtered = history[-n:]
+    elif range_param == "7d":
+        n = min(total_minutes, 10080)  # 7 days
+        filtered = history[-n:]
+    else:  # default 24h
+        n = min(total_minutes, 1440)  # 24 hours
+        filtered = history[-n:]
+
+    # Downsampling
+    if range_param == "24h" or range_param == "all" and len(filtered) <= 1440:
+        step = 1  # no downsampling for 24h
+    elif range_param == "7d":
+        step = max(1, len(filtered) // 300)  # target ~300 points
+    elif range_param == "30d":
+        step = max(1, len(filtered) // 300)
+    elif range_param == "all" and len(filtered) > 1440:
+        step = max(1, len(filtered) // 500)
+    else:
+        step = 1
+
+    # Build per-variable series
+    series = {}
+    for var in variables:
+        series[var] = []
+
+    for i, h in enumerate(filtered):
+        if i % step != 0 and i != len(filtered) - 1:
+            continue  # downsample (but always include last point)
+
+        sim_time = h.get("sim_time", "")
+        sim_minute = h.get("sim_minute", 0)
+        sd = h.get("sensor_data", {})
+        plant = h.get("plant", {})
+
+        for var in variables:
+            if var in ("stress", "growth"):
+                value = plant.get(var)
+            elif var == "leaf_temp_delta":
+                value = sd.get("leaf_temp_delta") or plant.get("leaf_temp_delta")
+            elif var == "leaf_temp":
+                value = plant.get("leaf_temp")
+            else:
+                value = sd.get(var)
+
+            if value is not None:
+                series[var].append({
+                    "sim_time": sim_time,
+                    "sim_minute": sim_minute,
+                    "value": round(value, 2),
+                    "data_type": "observed",
+                })
+
+    # Count total returned points
+    total_returned = sum(len(s) for s in series.values())
+
+    return jsonify({
+        "success": True,
+        "range": range_param,
+        "from_minute": filtered[0].get("sim_minute", 0) if filtered else 0,
+        "to_minute": filtered[-1].get("sim_minute", 0) if filtered else 0,
+        "total_raw_points": len(filtered),
+        "total_returned_points": total_returned,
+        "downsample_step": step,
+        "series": series,
+        "current_sim_minute": int(_simulator.weather.sim_minute) % 1440 if hasattr(_simulator, 'weather') else 0,
+        "current_sim_time": _simulator.sim_time_str() if hasattr(_simulator, 'sim_time_str') else "00:00",
+    })
+
+
+# ============================================================
 # Hardware Integration Endpoints (additive — no modifications above)
 # ============================================================
 

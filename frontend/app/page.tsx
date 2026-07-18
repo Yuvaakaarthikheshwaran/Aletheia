@@ -145,6 +145,19 @@ export default function Home() {
   const [sessionExportLoading, setSessionExportLoading] = useState(false);
   const [hardwarePacketStatus, setHardwarePacketStatus] = useState<string | null>(null);
 
+  // --- Temporal Navigation State (NEW) ---
+  // selectedTime: null = LIVE/NOW; number = viewing a specific sim_minute
+  const [selectedTime, setSelectedTime] = useState<number | null>(null);
+  // temporalRange: the time window being viewed
+  const [temporalRange, setTemporalRange] = useState<string>("24h");
+  // temporalSeries: per-variable historical data from the backend
+  const [temporalSeries, setTemporalSeries] = useState<Record<string, any[]> | null>(null);
+  // temporalSeriesLoading: loading state for historical data fetch
+  const [temporalSeriesLoading, setTemporalSeriesLoading] = useState(false);
+  // temporalViewMode: "live" | "historical" | "forecast"
+  const temporalViewMode: "live" | "historical" | "forecast" =
+    selectedTime === null ? "live" : "historical";
+
   // --- Fetch simulator state (scenario list, current state) ---
   const fetchSimState = useCallback(async () => {
     const result = await safeFetch("/simulator/state");
@@ -264,6 +277,40 @@ export default function Home() {
     setCompareLoading(false);
   }, []);
 
+  // --- Temporal Navigation: fetch historical data for a time range ---
+  const fetchTemporalHistory = useCallback(async (range: string = "24h") => {
+    setTemporalSeriesLoading(true);
+    const result = await safeFetch(
+      `/simulator/temporal/history?range=${range}&variables=air_temp,humidity,soil_moisture,leaf_temp_delta,light,soil_temp,stress,growth`
+    );
+    if (result.ok && result.data) {
+      setTemporalSeries(result.data.series || {});
+      setTemporalRange(range);
+    } else {
+      console.error("Temporal history fetch error:", result.error);
+    }
+    setTemporalSeriesLoading(false);
+  }, []);
+
+  // --- Temporal Navigation: jump to a specific sim_minute ---
+  const jumpToTime = useCallback((minute: number | null) => {
+    setSelectedTime(minute);
+    if (minute !== null) {
+      // Also trigger replay fetch for detailed state at that minute
+      fetchReplay(minute);
+    }
+  }, [fetchReplay]);
+
+  // --- Temporal Navigation: return to LIVE/NOW ---
+  const returnToLive = useCallback(() => {
+    setSelectedTime(null);
+    setReplayMinute(null);
+    setReplayData(null);
+    setTemporalRange("24h");
+    // Re-fetch current state
+    fetchSimState();
+  }, [fetchSimState]);
+
   // --- Hardware: fetch device status ---
   const fetchDeviceStatus = useCallback(async () => {
     const result = await safeFetch("/hardware/status");
@@ -324,7 +371,7 @@ export default function Home() {
 
     if (!result.ok) {
       setHardwarePacketStatus(`Error: ${result.error}`);
-      setError(result.error);
+      setError(result.error ?? null);
       console.error("Hardware packet error:", result.error, "status:", result.status);
       setLoading(false);
       return;
@@ -462,6 +509,13 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [hardwareMode, liveMode, sendHardwarePacket]);
 
+  // Temporal history: fetch when range changes or on initial load (live mode)
+  useEffect(() => {
+    if (!hardwareMode && temporalViewMode === "live") {
+      fetchTemporalHistory(temporalRange);
+    }
+  }, [temporalRange, hardwareMode, fetchTemporalHistory]);
+
   // --- Data extraction from unified response ---
   const sensor = data?.sensor_validation?.repaired_data || data?._simulator?.sensor_data;
   const plantProfile = data?.plant_profile;
@@ -478,36 +532,83 @@ export default function Home() {
   // Build trajectory data from simulator history + future prediction projection
   const trajectory: any[] = simulator?.trajectory || [];
   const currentSimMinute = simulator?.sim_minute ?? simState?.sim_minute ?? 0;
+  const currentSimTime = simulator?.sim_time ?? simState?.sim_time ?? "12:00";
 
-  // Build chart data: historical trajectory + NOW marker + future prediction
-  const chartData = trajectory.map((point: any) => ({
-    label: point.sim_time,
-    minute: point.sim_minute,
-    air_temp: point.air_temp,
-    humidity: point.humidity,
-    soil_moisture: point.soil_moisture,
-    leaf_temp_delta: point.leaf_temp_delta,
-    stress: point.stress,
-    growth: point.growth,
-    type: "past",
-  }));
+  // ---- NEW: Temporal-state-aware chart data building ----
+  // Priority: temporalSeries (from dedicated history endpoint) > trajectory (from /analyze)
+  // This gives us properly downsampled, type-labeled historical data
 
-  // Add current state as NOW marker if not already the last entry
-  const nowEntry = {
-    label: "NOW",
-    minute: currentSimMinute,
-    air_temp: sensor?.air_temp,
-    humidity: sensor?.humidity,
-    soil_moisture: sensor?.soil_moisture,
-    leaf_temp_delta: sensor?.leaf_temp_delta,
-    stress: simState?.plant?.stress ?? 0,
-    growth: simState?.plant?.growth ?? 0,
-    type: "now",
+  // Build PAST data from temporalSeries if available, otherwise fall back to trajectory
+  const buildPastData = (): any[] => {
+    if (temporalSeries && Object.keys(temporalSeries).length > 0) {
+      // Use the dedicated temporal history endpoint data
+      // Merge all variables into unified data points keyed by sim_minute
+      const pointMap = new Map<number, any>();
+      for (const [varName, points] of Object.entries(temporalSeries)) {
+        for (const p of points) {
+          if (!pointMap.has(p.sim_minute)) {
+            pointMap.set(p.sim_minute, {
+              label: p.sim_time,
+              minute: p.sim_minute,
+              type: "past",
+              _dataType: p.data_type || "observed",
+            });
+          }
+          const entry = pointMap.get(p.sim_minute)!;
+          entry[varName] = p.value;
+        }
+      }
+      // Convert to sorted array
+      return Array.from(pointMap.values()).sort((a, b) => a.minute - b.minute);
+    }
+    // Fallback: use trajectory from /analyze response
+    return trajectory.map((point: any) => ({
+      label: point.sim_time,
+      minute: point.sim_minute,
+      air_temp: point.air_temp,
+      humidity: point.humidity,
+      soil_moisture: point.soil_moisture,
+      leaf_temp_delta: point.leaf_temp_delta,
+      stress: point.stress,
+      growth: point.growth,
+      type: "past",
+      _dataType: "observed",
+    }));
   };
 
-  // Future prediction projection (simple linear extrapolation from last 2 points)
+  const chartData = buildPastData();
+
+  // Determine the effective "now" minute based on temporal view mode
+  const effectiveNowMinute = selectedTime !== null ? selectedTime : currentSimMinute;
+  const effectiveNowTime = selectedTime !== null
+    ? (replayData?.target?.sim_time || chartData.find(p => p.minute === selectedTime)?.label || `Min ${selectedTime}`)
+    : currentSimTime;
+
+  // Add current/live state as NOW marker
+  const nowSensorData = selectedTime !== null && replayData?.target?.sensor_data
+    ? replayData.target.sensor_data
+    : sensor;
+  const nowPlantData = selectedTime !== null && replayData?.target?.plant
+    ? replayData.target.plant
+    : simState?.plant;
+
+  const nowEntry = {
+    label: selectedTime !== null ? `● ${effectiveNowTime}` : "● NOW",
+    minute: effectiveNowMinute,
+    air_temp: nowSensorData?.air_temp,
+    humidity: nowSensorData?.humidity,
+    soil_moisture: nowSensorData?.soil_moisture,
+    leaf_temp_delta: nowSensorData?.leaf_temp_delta,
+    stress: nowPlantData?.stress ?? 0,
+    growth: nowPlantData?.growth ?? 0,
+    type: "now",
+    _dataType: "observed",
+  };
+
+  // Future prediction projection — only show when in LIVE mode
+  // Uses Temporal AI model output when available, falls back to linear extrapolation
   const futurePrediction: any[] = [];
-  if (chartData.length >= 2) {
+  if (temporalViewMode === "live" && chartData.length >= 2) {
     const last = chartData[chartData.length - 1];
     const prev = chartData[chartData.length - 2];
     const futureConfidence = temporal?.future_state?.future_confidence ?? 0.7;
@@ -525,6 +626,7 @@ export default function Home() {
         stress: last.stress,
         growth: last.growth,
         type: "future",
+        _dataType: "forecast",
         // Confidence band: wider as we go further into future
         ci_upper_temp: last.air_temp + (last.air_temp - prev.air_temp) * frac + (1 - futureConfidence) * 2 * (i),
         ci_lower_temp: last.air_temp + (last.air_temp - prev.air_temp) * frac - (1 - futureConfidence) * 2 * (i),
@@ -534,8 +636,13 @@ export default function Home() {
     }
   }
 
-  // Merge all for the full chart
-  const fullChartData = [...chartData, nowEntry, ...futurePrediction];
+  // Merge all for the full chart — past data up to effectiveNowMinute, then NOW, then future
+  const pastUpToNow = chartData.filter(p => p.minute <= effectiveNowMinute);
+  const pastAfterNow = chartData.filter(p => p.minute > effectiveNowMinute);
+  // When viewing historical time, data after selectedTime becomes "future from that perspective"
+  const pastAfterNowLabeled = pastAfterNow.map(p => ({ ...p, type: "future", _dataType: "observed" }));
+
+  const fullChartData = [...pastUpToNow, nowEntry, ...pastAfterNowLabeled, ...futurePrediction];
 
   // Stat card values from trajectory
   const pastTrend = chartData.length >= 2
@@ -1089,15 +1196,134 @@ export default function Home() {
             </div>
 
             {/* ============================================================ */}
-            {/* TEMPORAL AI ENGINE — Historical Trajectory + Future Prediction */}
+            {/* TEMPORAL AI ENGINE — Time-Navigable Historical + Future View */}
             {/* ============================================================ */}
             <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
-              <h2 className="text-3xl mb-2">Temporal AI Engine</h2>
-              <p className="text-gray-400 text-sm mb-6">
-                Historical sensor trajectory with future prediction projection.
-                Confidence bands widen as predictions extend further into the future.
-              </p>
+              {/* ---- Temporal Indicator Bar ---- */}
+              <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <div className="flex items-center gap-4">
+                  <h2 className="text-3xl">Temporal AI Engine</h2>
+                  {/* LIVE / HISTORICAL / FORECAST badge */}
+                  <span
+                    className={`px-4 py-1.5 rounded-full text-sm font-bold uppercase tracking-wider ${
+                      temporalViewMode === "live"
+                        ? "bg-green-500/20 text-green-400 border border-green-500/50 animate-pulse"
+                        : temporalViewMode === "historical"
+                        ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/50"
+                        : "bg-purple-500/20 text-purple-400 border border-purple-500/50"
+                    }`}
+                  >
+                    {temporalViewMode === "live" && "● LIVE"}
+                    {temporalViewMode === "historical" && "◷ HISTORICAL"}
+                  </span>
+                </div>
 
+                {/* Current displayed time with timezone */}
+                <div className="text-right">
+                  <p className="text-gray-400 text-xs uppercase tracking-wider">Viewing Time (IST)</p>
+                  <p className="text-xl font-mono text-white">
+                    {selectedTime !== null
+                      ? (replayData?.target?.sim_time || `Min ${selectedTime}`)
+                      : currentSimTime}
+                    <span className="text-gray-500 text-sm ml-1">IST</span>
+                  </p>
+                  {selectedTime !== null && (
+                    <p className="text-xs text-yellow-400 mt-1">
+                      Viewing historical state — data shown as it was at this moment
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* ---- Time Navigation Bar ---- */}
+              <div className="flex flex-wrap items-center gap-2 mb-6 p-4 bg-black/30 rounded-2xl border border-white/5">
+                {/* Time range selector */}
+                <select
+                  value={temporalRange}
+                  onChange={(e) => {
+                    setTemporalRange(e.target.value);
+                    if (temporalViewMode === "live") {
+                      fetchTemporalHistory(e.target.value);
+                    }
+                  }}
+                  className="bg-black/40 border border-gray-600 rounded-lg px-3 py-2 text-sm text-white"
+                >
+                  <option value="24h">Last 24 Hours</option>
+                  <option value="7d">Last 7 Days</option>
+                  <option value="30d">Last 30 Days</option>
+                  <option value="all">All History</option>
+                </select>
+
+                <div className="h-6 w-px bg-gray-700 mx-1" />
+
+                {/* Quick-jump buttons */}
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 1440))}
+                  disabled={effectiveNowMinute < 1440}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  title="Jump back 24 hours"
+                >
+                  ◀◀ 24H
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 120))}
+                  disabled={effectiveNowMinute < 120}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  title="Jump back 2 hours"
+                >
+                  ◀ 2H
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 30))}
+                  disabled={effectiveNowMinute < 30}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  title="Jump back 30 minutes"
+                >
+                  ◀ 30m
+                </button>
+
+                {/* NOW button */}
+                <button
+                  onClick={returnToLive}
+                  className={`px-4 py-1.5 text-xs font-bold rounded-lg transition ${
+                    temporalViewMode === "live"
+                      ? "bg-green-600 text-white cursor-default"
+                      : "bg-yellow-600 hover:bg-yellow-500 text-white"
+                  }`}
+                  title="Return to live / current time"
+                >
+                  ● NOW
+                </button>
+
+                <button
+                  onClick={() => jumpToTime(Math.min(currentSimMinute, effectiveNowMinute + 30))}
+                  disabled={effectiveNowMinute >= currentSimMinute}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  title="Jump forward 30 minutes"
+                >
+                  30m ▶
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.min(currentSimMinute, effectiveNowMinute + 120))}
+                  disabled={effectiveNowMinute >= currentSimMinute}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  title="Jump forward 2 hours"
+                >
+                  2H ▶
+                </button>
+
+                {/* Return to Live — prominent when viewing history */}
+                {temporalViewMode !== "live" && (
+                  <button
+                    onClick={returnToLive}
+                    className="ml-auto px-5 py-2 text-sm font-bold bg-green-600 hover:bg-green-500 rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-green-600/20"
+                  >
+                    <span>⟳</span> Return to Live
+                  </button>
+                )}
+              </div>
+
+              {/* ---- Stat Cards ---- */}
               <div className="grid grid-cols-4 gap-4 mb-8">
                 <div className="bg-black/20 rounded-2xl p-5">
                   <p className="text-gray-400 text-sm">Past → Now Trend</p>
@@ -1132,7 +1358,23 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Full Trajectory Chart: Past (solid) + NOW (marker) + Future (dashed + confidence bands) */}
+              {/* ---- Data availability notice ---- */}
+              {temporalSeries && (
+                <div className="text-xs text-gray-500 mb-4 flex items-center gap-2">
+                  <span>●</span>
+                  <span>
+                    Showing {fullChartData.filter(d => d.type === "past").length} historical points
+                    {temporalViewMode === "live" && futurePrediction.length > 0 && (
+                      <> + {futurePrediction.length} forecast points</>
+                    )}
+                    {temporalViewMode === "historical" && pastAfterNow.length > 0 && (
+                      <> (data after selected time shown for context)</>
+                    )}
+                  </span>
+                </div>
+              )}
+
+              {/* ---- Full Trajectory Chart: Past (solid) + NOW (marker) + Future (dashed + confidence bands) ---- */}
               <ResponsiveContainer width="100%" height={350}>
                 <LineChart data={fullChartData}>
                   <CartesianGrid stroke="#333" strokeDasharray="3 3" />
@@ -1143,16 +1385,63 @@ export default function Home() {
                   />
                   <YAxis tick={{ fill: "#888", fontSize: 11 }} />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "#111",
-                      border: "1px solid #333",
-                      borderRadius: "12px",
+                    content={({ active, payload, label }) => {
+                      if (!active || !payload || payload.length === 0) return null;
+                      const dataPoint = payload[0]?.payload;
+                      const dataType = dataPoint?._dataType || "observed";
+                      const dataTypeLabel =
+                        dataType === "observed" ? "Observed" :
+                        dataType === "forecast" ? "AI Forecast" :
+                        dataType === "estimated" ? "Estimated" : dataType;
+                      const dataTypeColor =
+                        dataType === "observed" ? "#00ff99" :
+                        dataType === "forecast" ? "#ff6600" :
+                        dataType === "estimated" ? "#ffcc00" : "#888";
+                      return (
+                        <div
+                          style={{
+                            backgroundColor: "#111",
+                            border: "1px solid #333",
+                            borderRadius: "12px",
+                            padding: "12px 16px",
+                            minWidth: "200px",
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+                            <span style={{ color: "#fff", fontWeight: "bold", fontSize: "14px" }}>
+                              {label}
+                            </span>
+                            <span style={{ color: dataTypeColor, fontSize: "11px", fontWeight: "bold" }}>
+                              {dataTypeLabel}
+                            </span>
+                          </div>
+                          <div style={{ color: "#888", fontSize: "11px", marginBottom: "6px" }}>
+                            Sim Minute: {dataPoint?.minute} · IST (UTC+5:30)
+                          </div>
+                          {payload.map((entry: any, idx: number) => (
+                            <div
+                              key={idx}
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                color: entry.color || "#fff",
+                                fontSize: "13px",
+                                padding: "2px 0",
+                              }}
+                            >
+                              <span>{entry.name}</span>
+                              <span style={{ fontWeight: "bold" }}>
+                                {typeof entry.value === "number" ? entry.value.toFixed(1) : entry.value}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      );
                     }}
-                    labelStyle={{ color: "#fff" }}
                   />
                   <Legend />
 
-                  {/* Past air_temp — solid green */}
+                  {/* Past air_temp — solid green (observed data) */}
                   <Line
                     type="monotone"
                     dataKey="air_temp"
@@ -1176,15 +1465,16 @@ export default function Home() {
 
                   {/* NOW marker — vertical reference line */}
                   <ReferenceLine
-                    x="NOW"
+                    x={nowEntry.label}
                     stroke="#ffcc00"
                     strokeWidth={2}
                     strokeDasharray="6 6"
                     label={{
-                      value: "NOW",
+                      value: selectedTime !== null ? "VIEWING" : "NOW",
                       position: "top",
                       fill: "#ffcc00",
                       fontSize: 12,
+                      fontWeight: "bold",
                     }}
                   />
 
@@ -1212,21 +1502,31 @@ export default function Home() {
                     connectNulls
                   />
 
-                  {/* Future predicted air_temp — dashed green */}
+                  {/* Soil moisture — solid amber */}
                   <Line
                     type="monotone"
-                    dataKey="air_temp"
-                    stroke="#00ff99"
-                    strokeWidth={2}
-                    strokeDasharray="8 4"
-                    dot={{ r: 3, fill: "#00ff99" }}
-                    name="Predicted Temp"
+                    dataKey="soil_moisture"
+                    stroke="#f59e0b"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="Soil Moisture (%)"
+                    connectNulls
+                  />
+
+                  {/* Leaf temp delta — solid cyan */}
+                  <Line
+                    type="monotone"
+                    dataKey="leaf_temp_delta"
+                    stroke="#06b6d4"
+                    strokeWidth={1.5}
+                    dot={false}
+                    name="Leaf ΔT (°C)"
                     connectNulls
                   />
                 </LineChart>
               </ResponsiveContainer>
 
-              {/* Explainable AI */}
+              {/* ---- Explainable AI ---- */}
               <div className="mt-6 bg-black/20 rounded-2xl p-6">
                 <h3 className="text-xl mb-4">AI Reasoning</h3>
 
@@ -1398,27 +1698,35 @@ export default function Home() {
               <p className="text-gray-400 text-sm mb-6">
                 Navigate through the simulation history. Drag the slider to inspect
                 sensor readings, plant state, and AI predictions at any past moment.
+                The Temporal AI graph above will sync to the selected time.
               </p>
 
-              {/* Replay Slider */}
+              {/* Replay Slider — synced with selectedTime */}
               <div className="mb-6">
                 <label className="text-gray-400 text-sm mb-2 block">
-                  Sim Minute: {replayMinute ?? currentSimMinute}
+                  Sim Minute: {selectedTime ?? currentSimMinute}
+                  {selectedTime !== null && (
+                    <span className="text-yellow-400 ml-2">(Historical View)</span>
+                  )}
                 </label>
                 <input
                   type="range"
                   min={0}
                   max={currentSimMinute || 1439}
-                  value={replayMinute ?? currentSimMinute ?? 0}
+                  value={selectedTime ?? currentSimMinute ?? 0}
                   onChange={(e) => {
                     const v = parseInt(e.target.value);
                     setReplayMinute(v);
                   }}
                   onMouseUp={() => {
-                    if (replayMinute !== null) fetchReplay(replayMinute);
+                    if (replayMinute !== null) {
+                      jumpToTime(replayMinute);
+                    }
                   }}
                   onTouchEnd={() => {
-                    if (replayMinute !== null) fetchReplay(replayMinute);
+                    if (replayMinute !== null) {
+                      jumpToTime(replayMinute);
+                    }
                   }}
                   className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer
                     accent-green-500"
@@ -1430,6 +1738,18 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* Return to Live button for replay section */}
+              {selectedTime !== null && (
+                <div className="mb-6">
+                  <button
+                    onClick={returnToLive}
+                    className="px-5 py-2 text-sm font-bold bg-green-600 hover:bg-green-500 rounded-xl transition-all flex items-center gap-2"
+                  >
+                    <span>⟳</span> Return to Live
+                  </button>
+                </div>
+              )}
+
               {/* Replay Result */}
               {replayLoading && (
                 <div className="text-center text-gray-400 py-4">Loading replay state...</div>
@@ -1440,7 +1760,7 @@ export default function Home() {
                   {/* Target State */}
                   <div className="bg-black/20 rounded-2xl p-5">
                     <h3 className="text-green-400 mb-3">
-                      State at {replayData.target?.sim_time || replayMinute}
+                      State at {replayData.target?.sim_time || selectedTime}
                     </h3>
                     <div className="space-y-2 text-sm">
                       <p>Air Temp: {replayData.target?.sensor_data?.air_temp?.toFixed(1) || "—"}°C</p>
