@@ -34,6 +34,7 @@ from backend.parser_extractor import parse_plant_data
 from backend.openrouter_extractor import extract_with_openrouter
 from backend.plant_profile_schema import DEFAULT_PROFILE
 from backend.ai_reasoning_cache import get_cached_ai_reasoning, store_ai_reasoning
+from backend.local_reasoning import generate_local_reasoning
 import hashlib
 
 
@@ -377,9 +378,25 @@ def run_unified_pipeline(
     )
     response["confidence"] = confidence
 
-    # --- Step 7: OpenRouter AI Reasoning ---
-    # Generate a cache key based on core inputs for AI reasoning
-    # Using a simple hash of relevant data to identify unique reasoning contexts
+    # --- Step 7: AI Reasoning (Local + OpenRouter Enhancement) ---
+    # Always generate local reasoning first — guaranteed to work, no API dependency.
+    # Then try OpenRouter as an optional enhancement layer for richer narrative.
+    # If OpenRouter succeeds, use its output; if it fails, the local reasoning
+    # is already there as a solid, data-driven base.
+
+    ai_reasoning = generate_local_reasoning(
+        plant_name=plant_name,
+        growth_stage=growth_stage,
+        phase=phase,
+        sensor_data=repaired_data,
+        temporal_prediction=temporal_result,
+        biology_analysis=biology_result,
+        stress_analysis=response["stress_analysis"],
+        confidence_scores=confidence,
+    )
+    logger.info("Local AI reasoning generated successfully.")
+
+    # Generate cache key for OpenRouter (used for caching successful API calls)
     reasoning_context_str = json.dumps({
         "plant": plant_name,
         "stage": growth_stage,
@@ -395,15 +412,17 @@ def run_unified_pipeline(
     }, sort_keys=True)
     cache_key = hashlib.md5(reasoning_context_str.encode("utf-8")).hexdigest()
 
-    ai_reasoning = get_cached_ai_reasoning(cache_key)
-    
-    if ai_reasoning:
-        logger.info(f"AI Reasoning cache hit for {cache_key[:8]}...")
-        ai_reasoning["_source"] = "ai_reasoning_cache"
+    # Check if we have a cached OpenRouter result for this context
+    cached_or = get_cached_ai_reasoning(cache_key)
+    if cached_or and not cached_or.get("_fallback") and not cached_or.get("_partial"):
+        logger.info(f"OpenRouter cache hit for {cache_key[:8]}... Using cached OpenRouter reasoning.")
+        cached_or["_source"] = "openrouter_cached"
+        ai_reasoning = cached_or
     else:
-        logger.info(f"AI Reasoning cache miss for {cache_key[:8]}... Calling OpenRouter.")
+        # Try OpenRouter as enhancement layer
+        logger.info(f"Attempting OpenRouter enhancement for {cache_key[:8]}...")
         try:
-            ai_reasoning = _call_openrouter_reasoning(
+            or_reasoning = _call_openrouter_reasoning(
                 plant_name=plant_name,
                 plant_profile=plant_profile,
                 sensor_data=repaired_data,
@@ -412,33 +431,19 @@ def run_unified_pipeline(
                 stress_analysis=response["stress_analysis"],
                 confidence_scores=confidence,
             )
-            # If successful, store in cache
-            if ai_reasoning and not ai_reasoning.get("_fallback") and not ai_reasoning.get("_partial"):
-                store_ai_reasoning(cache_key, ai_reasoning)
-        except Exception as e:
-            # Catch any OpenRouter specific errors (e.g., 402 Insufficient Credits)
-            if hasattr(e, 'response') and e.response.status_code == 402:
-                logger.warning(f"OpenRouter API Error (402): {e.response.json().get('error', {}).get('message', 'Insufficient Credits')}")
-                logger.info("Falling back to AI Reasoning cache or generic fallback.")
-                ai_reasoning = get_cached_ai_reasoning(cache_key)
-                if not ai_reasoning:
-                    ai_reasoning = {
-                        "explanation": "AI reasoning engine unavailable (credits exhausted). Analysis based on sensor data and biological models.",
-                        "diagnosis": "Unable to generate AI diagnosis at this time due to API limits.",
-                        "recommendations": [
-                            "Monitor sensor readings closely",
-                            "Check plant for visible stress signs",
-                            "Review biology engine warnings"
-                        ],
-                        "confidence_narrative": "Confidence based on sensor validation and temporal models only; AI reasoning is a fallback.",
-                        "_fallback": True,
-                        "_api_error": True,
-                    }
-                else:
-                    ai_reasoning["_source"] = "ai_reasoning_cache_fallback"
+            # If OpenRouter succeeded (no fallback flag), use its richer output
+            if or_reasoning and not or_reasoning.get("_fallback") and not or_reasoning.get("_partial"):
+                logger.info("OpenRouter enhancement succeeded — using enriched reasoning.")
+                or_reasoning["_source"] = "openrouter"
+                ai_reasoning = or_reasoning
+                store_ai_reasoning(cache_key, or_reasoning)
             else:
-                # Re-raise other unexpected exceptions
-                raise
+                logger.info("OpenRouter returned fallback/partial — keeping local reasoning.")
+        except Exception as e:
+            if hasattr(e, 'response') and e.response.status_code == 402:
+                logger.warning(f"OpenRouter API Error (402): Insufficient Credits. Keeping local reasoning.")
+            else:
+                logger.warning(f"OpenRouter call failed: {e}. Keeping local reasoning.")
 
     response["ai_reasoning"] = ai_reasoning
 

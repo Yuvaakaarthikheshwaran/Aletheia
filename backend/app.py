@@ -39,6 +39,7 @@ from backend.unified_pipeline import (
     _call_openrouter_reasoning,
 )
 from backend.ai_reasoning_cache import store_ai_reasoning
+from backend.local_reasoning import generate_local_reasoning
 from backend.biology_engine import evaluate_biology
 from ai.sensor_guard import validate_sensor_data
 from ai.unified_engine import unified_analysis
@@ -455,7 +456,23 @@ def simulator_reasoning():
             2,
         )
 
-        # Step 7: OpenRouter AI Reasoning (force fresh call, skip cache)
+        # Step 7: AI Reasoning (Local + OpenRouter Enhancement)
+        # Always generate local reasoning first — guaranteed to work.
+        # Then try OpenRouter as enhancement for richer narrative on retry.
+
+        ai_reasoning = generate_local_reasoning(
+            plant_name=plant_name,
+            growth_stage=growth_stage,
+            phase=phase,
+            sensor_data=repaired_data,
+            temporal_prediction=temporal_result,
+            biology_analysis=biology_result,
+            stress_analysis=stress_analysis,
+            confidence_scores=confidence,
+        )
+        logger.info("Local AI reasoning generated for retry endpoint.")
+
+        # Try OpenRouter as enhancement (force fresh call, skip cache for retry)
         import hashlib
         reasoning_context_str = json.dumps({
             "plant": plant_name,
@@ -472,20 +489,25 @@ def simulator_reasoning():
         }, sort_keys=True)
         cache_key = hashlib.md5(reasoning_context_str.encode("utf-8")).hexdigest()
 
-        # Force fresh call — bypass cache for retry
-        ai_reasoning = _call_openrouter_reasoning(
-            plant_name=plant_name,
-            plant_profile=plant_profile,
-            sensor_data=repaired_data,
-            temporal_prediction=temporal_result,
-            biology_analysis=biology_result,
-            stress_analysis=stress_analysis,
-            confidence_scores=confidence,
-        )
-
-        # Store successful result in cache for future use
-        if ai_reasoning and not ai_reasoning.get("_fallback") and not ai_reasoning.get("_partial"):
-            store_ai_reasoning(cache_key, ai_reasoning)
+        try:
+            or_reasoning = _call_openrouter_reasoning(
+                plant_name=plant_name,
+                plant_profile=plant_profile,
+                sensor_data=repaired_data,
+                temporal_prediction=temporal_result,
+                biology_analysis=biology_result,
+                stress_analysis=stress_analysis,
+                confidence_scores=confidence,
+            )
+            if or_reasoning and not or_reasoning.get("_fallback") and not or_reasoning.get("_partial"):
+                logger.info("OpenRouter enhancement succeeded on retry — using enriched reasoning.")
+                or_reasoning["_source"] = "openrouter_retry"
+                ai_reasoning = or_reasoning
+                store_ai_reasoning(cache_key, or_reasoning)
+            else:
+                logger.info("OpenRouter returned fallback on retry — keeping local reasoning.")
+        except Exception as or_err:
+            logger.warning(f"OpenRouter retry failed: {or_err}. Keeping local reasoning.")
 
         # Merge recommendations
         recommendations = []
@@ -505,6 +527,27 @@ def simulator_reasoning():
     except Exception as e:
         logger.error(f"AI Reasoning retry failed: {e}")
         traceback.print_exc()
+        # Even on total failure, try to generate local reasoning as last resort
+        try:
+            body = request.get_json(silent=True) or {}
+            sensor_data = body.get("sensor_data", {})
+            if sensor_data:
+                fallback_reasoning = generate_local_reasoning(
+                    plant_name=body.get("plant", "tomato"),
+                    growth_stage=body.get("stage", "vegetative"),
+                    phase=body.get("phase", "day"),
+                    sensor_data=sensor_data,
+                    temporal_prediction={"status": "unknown", "future_state": {}},
+                    biology_analysis={"health_score": 50, "warnings": [], "analysis": {}},
+                    stress_analysis={"prediction": "unknown", "severity": 0, "risk_state": "unknown", "reasons": [], "recommendation": ""},
+                    confidence_scores={"overall": 50, "sensor_confidence": 50, "ai_confidence": 50, "temporal_confidence": 50, "biology_health_score": 50},
+                )
+                return jsonify({
+                    "ai_reasoning": fallback_reasoning,
+                    "recommendations": fallback_reasoning.get("recommendations", []),
+                })
+        except Exception:
+            pass
         return jsonify({
             "error": "ai_reasoning_failed",
             "message": str(e),
