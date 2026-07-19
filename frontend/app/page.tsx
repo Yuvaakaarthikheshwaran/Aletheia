@@ -14,6 +14,7 @@ import {
   RadarChart,
   PolarGrid,
   PolarAngleAxis,
+  PolarRadiusAxis,
   Radar,
   ReferenceLine,
   Legend,
@@ -137,8 +138,13 @@ export default function Home() {
   const [compareData, setCompareData] = useState<any>(null);
   const [compareLoading, setCompareLoading] = useState(false);
 
+  // --- Operating Mode State ---
+  // "simulator" = digital twin simulation (default)
+  // "hardware"  = real ESP32-S3 hardware (requires device connection)
+  // "replay"    = historical replay / temporal navigation
+  const [operatingMode, setOperatingMode] = useState<"simulator" | "hardware" | "replay">("simulator");
+
   // --- Hardware Integration State ---
-  const [hardwareMode, setHardwareMode] = useState(false);
   const [deviceStatus, setDeviceStatus] = useState<any>(null);
   const [hardwareHistory, setHardwareHistory] = useState<any[]>([]);
   const [calibrationData, setCalibrationData] = useState<any>(null);
@@ -334,7 +340,7 @@ export default function Home() {
   }, []);
 
   // --- Hardware: fetch calibration ---
-  const fetchCalibration = useCallback(async (deviceId: string = "ESP32-001") => {
+  const fetchCalibration = useCallback(async (deviceId: string = "ALETHEIA-ESP32-001") => {
     const result = await safeFetch(`/hardware/calibration?device_id=${deviceId}`);
     if (result.ok && result.data) {
       setCalibrationData(result.data);
@@ -353,7 +359,7 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         timestamp: now,
-        device_id: "ESP32-001",
+        device_id: "ALETHEIA-ESP32-001",
         plant: selectedPlant,
         stage: growthStage,
         mode: phase,
@@ -490,7 +496,7 @@ export default function Home() {
 
   // Hardware polling: fetch device status when in hardware mode
   useEffect(() => {
-    if (!hardwareMode) return;
+    if (operatingMode !== "hardware") return;
     fetchDeviceStatus();
     fetchHardwareHistory();
     fetchCalibration();
@@ -498,23 +504,23 @@ export default function Home() {
       fetchDeviceStatus();
     }, 5000);
     return () => clearInterval(interval);
-  }, [hardwareMode, fetchDeviceStatus, fetchHardwareHistory, fetchCalibration]);
+  }, [operatingMode, fetchDeviceStatus, fetchHardwareHistory, fetchCalibration]);
 
   // Hardware live stream: auto-send packets when in hardware live mode
   useEffect(() => {
-    if (!hardwareMode || !liveMode) return;
+    if (operatingMode !== "hardware" || !liveMode) return;
     const interval = setInterval(() => {
       sendHardwarePacket();
     }, 3000);
     return () => clearInterval(interval);
-  }, [hardwareMode, liveMode, sendHardwarePacket]);
+  }, [operatingMode, liveMode, sendHardwarePacket]);
 
   // Temporal history: fetch when range changes or on initial load (live mode)
   useEffect(() => {
-    if (!hardwareMode && temporalViewMode === "live") {
+    if (operatingMode === "hardware" && temporalViewMode === "live") {
       fetchTemporalHistory(temporalRange);
     }
-  }, [temporalRange, hardwareMode, fetchTemporalHistory]);
+  }, [temporalRange, operatingMode, fetchTemporalHistory]);
 
   // --- Data extraction from unified response ---
   const sensor = data?.sensor_validation?.repaired_data || data?._simulator?.sensor_data;
@@ -611,7 +617,9 @@ export default function Home() {
   if (temporalViewMode === "live" && chartData.length >= 2) {
     const last = chartData[chartData.length - 1];
     const prev = chartData[chartData.length - 2];
-    const futureConfidence = temporal?.future_state?.future_confidence ?? 0.7;
+    // future_confidence is 0-100 from backend; normalize to 0-1 for CI band math
+    const futureConfidenceRaw = temporal?.future_state?.future_confidence ?? 70;
+    const futureConfidence = Math.min(1, Math.max(0, futureConfidenceRaw / 100));
     const futureLabel = temporal?.future_state?.future_prediction ?? "stable";
 
     for (let i = 1; i <= 5; i++) {
@@ -684,9 +692,11 @@ export default function Home() {
           <div className="text-green-400">● AI Active</div>
           <div className="text-green-400">● Biology Active</div>
           {data && <div className="text-green-400">● Pipeline Live</div>}
-          {simRunning && !hardwareMode && <div className="text-blue-400">● Simulator Running</div>}
-          {hardwareMode && <div className="text-purple-400">● Hardware Mode</div>}
-          {hardwareMode && deviceStatus && (
+          {operatingMode === "simulator" && simRunning && <div className="text-blue-400">● Simulator Running</div>}
+          {operatingMode === "simulator" && !simRunning && <div className="text-yellow-400">● Simulator Paused</div>}
+          {operatingMode === "hardware" && <div className="text-purple-400">● Hardware Mode</div>}
+          {operatingMode === "replay" && <div className="text-yellow-400">● Replay Mode</div>}
+          {operatingMode === "hardware" && deviceStatus && (
             <div className={deviceStatus.online ? "text-green-400" : "text-red-400"}>
               ● Device {deviceStatus.online ? "Online" : "Offline"}
             </div>
@@ -697,145 +707,347 @@ export default function Home() {
         </div>
 
         {/* ============================================================ */}
-        {/* SIMULATOR CONTROLS */}
+        {/* OPERATING MODE SELECTOR + MODE-SPECIFIC CONTROLS */}
         {/* ============================================================ */}
         <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-6 mb-8">
-          <h2 className="text-2xl mb-4">Digital Twin Controls</h2>
-
-          <div className="grid grid-cols-7 gap-4 mb-4">
-            {/* Start */}
-            <button
-              onClick={() => simControl("start")}
-              className="bg-green-600 hover:bg-green-500 rounded-xl py-3 font-bold transition"
-            >
-              ▶ Start
-            </button>
-
-            {/* Pause */}
-            <button
-              onClick={() => simControl("pause")}
-              className="bg-yellow-600 hover:bg-yellow-500 rounded-xl py-3 font-bold transition"
-            >
-              ⏸ Pause
-            </button>
-
-            {/* Reset */}
-            <button
-              onClick={() => simControl("reset")}
-              className="bg-red-600 hover:bg-red-500 rounded-xl py-3 font-bold transition"
-            >
-              ↺ Reset
-            </button>
-
-            {/* Speed */}
-            <select
-              value={simSpeed}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                setSimSpeed(v);
-                simControl("speed", { speed: v });
-              }}
-              className="bg-white/5 border border-white/10 rounded-xl px-4 py-3"
-            >
-              <option value={0.5}>0.5x Speed</option>
-              <option value={1.0}>1x (Real-time)</option>
-              <option value={10.0}>10x Speed</option>
-              <option value={60.0}>60x (1h/s)</option>
-              <option value={120.0}>120x Speed</option>
-            </select>
-
-            {/* Scenario */}
-            <select
-              value={simScenario}
-              onChange={(e) => {
-                const v = e.target.value;
-                setSimScenario(v);
-                simControl("scenario", { scenario: v });
-              }}
-              className="bg-white/5 border border-white/10 rounded-xl px-4 py-3"
-            >
-              {Object.entries(scenarioList).map(([key, cfg]: any) => (
-                <option key={key} value={key}>
-                  {cfg.label || key}
-                </option>
-              ))}
-            </select>
-
-            {/* Live Mode */}
-            <button
-              onClick={() => {
-                if (!simRunning) simControl("start");
-                setLiveMode(!liveMode);
-              }}
-              className={`rounded-xl py-3 font-bold transition ${
-                liveMode ? "bg-red-500 hover:bg-red-400" : "bg-blue-500 hover:bg-blue-400"
-              }`}
-            >
-              {liveMode ? "⏹ Live ON" : "▶ Live OFF"}
-            </button>
-
-            {/* Mode Toggle */}
-            <button
-              onClick={() => {
-                setHardwareMode(!hardwareMode);
-                if (!hardwareMode) {
+          {/* ---- 3-Mode Segmented Selector ---- */}
+          <div className="flex items-center gap-2 mb-6">
+            <h2 className="text-2xl mr-4">Operating Mode</h2>
+            <div className="flex bg-black/40 rounded-xl p-1 border border-white/10">
+              <button
+                onClick={() => {
+                  setOperatingMode("simulator");
+                  setSelectedTime(null); // exit replay
+                }}
+                className={`px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 ${
+                  operatingMode === "simulator"
+                    ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                    : "text-gray-400 hover:text-white hover:bg-white/5"
+                }`}
+              >
+                <span>🖥</span> Simulator
+              </button>
+              <button
+                onClick={() => {
+                  setOperatingMode("hardware");
+                  setSelectedTime(null); // exit replay
                   fetchDeviceStatus();
                   fetchHardwareHistory();
                   fetchCalibration();
-                }
-              }}
-              className={`rounded-xl py-3 font-bold transition ${
-                hardwareMode ? "bg-purple-600 hover:bg-purple-500" : "bg-gray-600 hover:bg-gray-500"
-              }`}
-            >
-              {hardwareMode ? "🔌 HW Mode" : "🖥 Sim Mode"}
-            </button>
+                }}
+                className={`px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 ${
+                  operatingMode === "hardware"
+                    ? "bg-purple-600 text-white shadow-lg shadow-purple-600/20"
+                    : "text-gray-400 hover:text-white hover:bg-white/5"
+                }`}
+              >
+                <span>🔌</span> Hardware
+              </button>
+              <button
+                onClick={() => {
+                  setOperatingMode("replay");
+                  if (temporalSeries === null) fetchTemporalHistory("24h");
+                }}
+                className={`px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 ${
+                  operatingMode === "replay"
+                    ? "bg-yellow-600 text-white shadow-lg shadow-yellow-600/20"
+                    : "text-gray-400 hover:text-white hover:bg-white/5"
+                }`}
+              >
+                <span>◷</span> Replay
+              </button>
+            </div>
 
-            {/* Save Session */}
+            {/* Save Session — always available */}
             <button
-              onClick={() => saveSession(hardwareMode ? "hardware" : "simulator", "both")}
+              onClick={() => saveSession(operatingMode === "hardware" ? "hardware" : "simulator", "both")}
               disabled={sessionExportLoading}
-              className="bg-indigo-600 hover:bg-indigo-500 rounded-xl py-3 font-bold transition disabled:opacity-50"
+              className="ml-auto bg-indigo-600 hover:bg-indigo-500 rounded-xl px-5 py-2.5 font-bold transition disabled:opacity-50 text-sm"
             >
               {sessionExportLoading ? "..." : "💾 Save"}
             </button>
           </div>
 
-          {/* Simulator Status Bar */}
-          <div className="grid grid-cols-6 gap-4 text-sm">
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Status</span>
-              <p className={simRunning ? "text-green-400" : "text-yellow-400"}>
-                {simRunning ? "Running" : "Paused"}
-              </p>
-            </div>
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Sim Time</span>
-              <p className="text-white">{simState?.sim_time || simState?.simTime || "12:00"}</p>
-            </div>
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Day Phase</span>
-              <p className="text-white">{simState?.day_phase || simState?.dayPhase || "day"}</p>
-            </div>
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Scenario</span>
-              <p className="text-blue-300">{simState?.scenario || simScenario}</p>
-            </div>
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Temperature</span>
-              <p className="text-white">{simState?.weather?.air_temp?.toFixed(1) || "—"}°C</p>
-            </div>
-            <div className="bg-black/20 rounded-xl p-3">
-              <span className="text-gray-400">Humidity</span>
-              <p className="text-white">{simState?.weather?.humidity?.toFixed(1) || "—"}%</p>
-            </div>
-          </div>
+          {/* ---- SIMULATOR MODE CONTROLS ---- */}
+          {operatingMode === "simulator" && (
+            <>
+              <div className="grid grid-cols-6 gap-4 mb-4">
+                <button
+                  onClick={() => simControl("start")}
+                  disabled={simRunning}
+                  className="bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl py-3 font-bold transition"
+                >
+                  ▶ {simRunning ? "Running" : "Start"}
+                </button>
+                <button
+                  onClick={() => simControl("pause")}
+                  disabled={!simRunning}
+                  className="bg-yellow-600 hover:bg-yellow-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl py-3 font-bold transition"
+                >
+                  ⏸ Pause
+                </button>
+                <button
+                  onClick={() => simControl("reset")}
+                  className="bg-red-600 hover:bg-red-500 rounded-xl py-3 font-bold transition"
+                >
+                  ↺ Reset
+                </button>
+                <select
+                  value={simSpeed}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    setSimSpeed(v);
+                    simControl("speed", { speed: v });
+                  }}
+                  className="bg-white/5 border border-white/10 rounded-xl px-4 py-3"
+                >
+                  <option value={0.5}>0.5x Speed</option>
+                  <option value={1.0}>1x (Real-time)</option>
+                  <option value={10.0}>10x Speed</option>
+                  <option value={60.0}>60x (1h/s)</option>
+                  <option value={120.0}>120x Speed</option>
+                </select>
+                <select
+                  value={simScenario}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setSimScenario(v);
+                    simControl("scenario", { scenario: v });
+                  }}
+                  className="bg-white/5 border border-white/10 rounded-xl px-4 py-3"
+                >
+                  {Object.entries(scenarioList).map(([key, cfg]: any) => (
+                    <option key={key} value={key}>
+                      {cfg.label || key}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => {
+                    if (!simRunning) simControl("start");
+                    setLiveMode(!liveMode);
+                  }}
+                  className={`rounded-xl py-3 font-bold transition ${
+                    liveMode ? "bg-red-500 hover:bg-red-400" : "bg-blue-500 hover:bg-blue-400"
+                  }`}
+                >
+                  {liveMode ? "⏹ Stop Live" : "▶ Start Live"}
+                </button>
+              </div>
+
+              {/* Simulator Status Bar */}
+              <div className="grid grid-cols-6 gap-4 text-sm">
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Status</span>
+                  <p className={simRunning ? "text-green-400" : "text-yellow-400"}>
+                    {simRunning ? "Running" : "Paused"}
+                  </p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Sim Time</span>
+                  <p className="text-white">{simState?.sim_time || simState?.simTime || "12:00"}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Day Phase</span>
+                  <p className="text-white">{simState?.day_phase || simState?.dayPhase || "day"}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Scenario</span>
+                  <p className="text-blue-300">{simState?.scenario || simScenario}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Temperature</span>
+                  <p className="text-white">{simState?.weather?.air_temp?.toFixed(1) || "—"}°C</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Humidity</span>
+                  <p className="text-white">{simState?.weather?.humidity?.toFixed(1) || "—"}%</p>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ---- HARDWARE MODE CONTROLS ---- */}
+          {operatingMode === "hardware" && (
+            <>
+              <div className="grid grid-cols-4 gap-4 mb-4">
+                <button
+                  onClick={() => { fetchDeviceStatus(); fetchHardwareHistory(); fetchCalibration(); }}
+                  className="bg-purple-600 hover:bg-purple-500 rounded-xl py-3 font-bold transition flex items-center justify-center gap-2"
+                >
+                  🔄 Refresh Device
+                </button>
+                <button
+                  onClick={() => sendHardwarePacket()}
+                  className="bg-green-600 hover:bg-green-500 rounded-xl py-3 font-bold transition flex items-center justify-center gap-2"
+                >
+                  📡 Send Test Packet
+                </button>
+                <button
+                  onClick={() => {
+                    setOperatingMode("simulator");
+                    setDeviceStatus(null);
+                    setHardwareHistory([]);
+                    setCalibrationData(null);
+                    setHardwarePacketStatus(null);
+                  }}
+                  className="bg-red-600/50 hover:bg-red-500 rounded-xl py-3 font-bold transition flex items-center justify-center gap-2"
+                >
+                  ⏏ Disconnect
+                </button>
+                <button
+                  onClick={() => { fetchHardwareHistory(1440); }}
+                  className="bg-indigo-600 hover:bg-indigo-500 rounded-xl py-3 font-bold transition flex items-center justify-center gap-2"
+                >
+                  📊 Full History
+                </button>
+              </div>
+
+              {/* Hardware Status Bar */}
+              <div className="grid grid-cols-6 gap-4 text-sm">
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Device</span>
+                  <p className={deviceStatus?.online ? "text-green-400" : "text-red-400"}>
+                    {deviceStatus?.online ? "● Online" : "● Offline"}
+                  </p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Last Packet</span>
+                  <p className="text-white">{deviceStatus?.last_packet_time || "—"}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Packet Age</span>
+                  <p className={deviceStatus?.online ? "text-green-400" : "text-red-400"}>
+                    {deviceStatus?.packet_age_seconds != null ? `${deviceStatus.packet_age_seconds}s` : "—"}
+                  </p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Packets</span>
+                  <p className="text-white">{hardwareHistory.length}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Sampling</span>
+                  <p className="text-white">{deviceStatus?.sampling_rate_hz?.toFixed(2) || "—"} Hz</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Firmware</span>
+                  <p className="text-white font-mono text-xs">{deviceStatus?.firmware_version || "—"}</p>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ---- REPLAY MODE CONTROLS ---- */}
+          {operatingMode === "replay" && (
+            <>
+              <div className="flex flex-wrap items-center gap-2 mb-4 p-4 bg-black/30 rounded-2xl border border-white/5">
+                <select
+                  value={temporalRange}
+                  onChange={(e) => {
+                    setTemporalRange(e.target.value);
+                    fetchTemporalHistory(e.target.value);
+                  }}
+                  className="bg-black/40 border border-gray-600 rounded-lg px-3 py-2 text-sm text-white"
+                >
+                  <option value="24h">Last 24 Hours</option>
+                  <option value="7d">Last 7 Days</option>
+                  <option value="30d">Last 30 Days</option>
+                  <option value="all">All History</option>
+                </select>
+
+                <div className="h-6 w-px bg-gray-700 mx-1" />
+
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 1440))}
+                  disabled={effectiveNowMinute < 1440}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  ◀◀ 24H
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 120))}
+                  disabled={effectiveNowMinute < 120}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  ◀ 2H
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.max(0, effectiveNowMinute - 30))}
+                  disabled={effectiveNowMinute < 30}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  ◀ 30m
+                </button>
+
+                <button
+                  onClick={returnToLive}
+                  className={`px-4 py-1.5 text-xs font-bold rounded-lg transition ${
+                    temporalViewMode === "live"
+                      ? "bg-green-600 text-white cursor-default"
+                      : "bg-yellow-600 hover:bg-yellow-500 text-white"
+                  }`}
+                >
+                  ● NOW
+                </button>
+
+                <button
+                  onClick={() => jumpToTime(Math.min(currentSimMinute, effectiveNowMinute + 30))}
+                  disabled={effectiveNowMinute >= currentSimMinute}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  30m ▶
+                </button>
+                <button
+                  onClick={() => jumpToTime(Math.min(currentSimMinute, effectiveNowMinute + 120))}
+                  disabled={effectiveNowMinute >= currentSimMinute}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-gray-700/50 hover:bg-gray-600 text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  2H ▶
+                </button>
+
+                {temporalViewMode !== "live" && (
+                  <button
+                    onClick={returnToLive}
+                    className="ml-auto px-5 py-2 text-sm font-bold bg-green-600 hover:bg-green-500 rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-green-600/20"
+                  >
+                    <span>⟳</span> Return to Live
+                  </button>
+                )}
+              </div>
+
+              {/* Replay Status Bar */}
+              <div className="grid grid-cols-4 gap-4 text-sm">
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">View Mode</span>
+                  <p className={temporalViewMode === "live" ? "text-green-400" : "text-yellow-400"}>
+                    {temporalViewMode === "live" ? "● LIVE" : "◷ HISTORICAL"}
+                  </p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Viewing Time (IST)</span>
+                  <p className="text-white font-mono">
+                    {selectedTime !== null
+                      ? (replayData?.target?.sim_time || `Min ${selectedTime}`)
+                      : currentSimTime}
+                  </p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Data Points</span>
+                  <p className="text-white">{fullChartData.length}</p>
+                </div>
+                <div className="bg-black/20 rounded-xl p-3">
+                  <span className="text-gray-400">Range</span>
+                  <p className="text-white">{temporalRange}</p>
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         {/* ============================================================ */}
         {/* HARDWARE DEVICE STATUS PANEL */}
         {/* ============================================================ */}
-        {hardwareMode && (
+        {operatingMode === "hardware" && (
           <div className="bg-white/5 backdrop-blur-xl border border-purple-500/20 rounded-3xl p-6 mb-8">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-2xl text-purple-300">🔌 Hardware Device Panel</h2>
@@ -848,7 +1060,7 @@ export default function Home() {
                 </button>
                 <button
                   onClick={() => {
-                    setHardwareMode(false);
+                    setOperatingMode("simulator");
                     setDeviceStatus(null);
                     setHardwareHistory([]);
                     setCalibrationData(null);
@@ -861,10 +1073,43 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Empty state: no device has ever connected */}
+            {!deviceStatus && hardwareHistory.length === 0 && (
+              <div className="bg-black/20 rounded-2xl p-10 text-center border border-dashed border-purple-500/30">
+                <div className="text-5xl mb-4">📡</div>
+                <h3 className="text-xl text-purple-300 mb-2">Waiting for Device</h3>
+                <p className="text-gray-400 max-w-md mx-auto mb-6">
+                  No ESP32 device has connected yet. The dashboard is listening for
+                  incoming sensor packets on <code className="text-purple-400 bg-black/30 px-1.5 py-0.5 rounded text-xs">POST /hardware/update</code>.
+                </p>
+                <div className="bg-black/30 rounded-xl p-4 max-w-lg mx-auto text-left text-xs font-mono text-gray-400 space-y-1">
+                  <p className="text-purple-400 mb-2">Expected JSON payload:</p>
+                  <p>{'{'}</p>
+                  <p className="pl-4"><span className="text-green-400">"device_id"</span>: <span className="text-yellow-300">"ALETHEIA-ESP32-001"</span>,</p>
+                  <p className="pl-4"><span className="text-green-400">"timestamp"</span>: <span className="text-yellow-300">"2026-07-18T17:00:00Z"</span>,</p>
+                  <p className="pl-4"><span className="text-green-400">"firmware_version"</span>: <span className="text-yellow-300">"1.0.0"</span>,</p>
+                  <p className="pl-4"><span className="text-green-400">"sensor_data"</span>: {'{'}</p>
+                  <p className="pl-8"><span className="text-green-400">"air_temp"</span>: <span className="text-yellow-300">28.5</span>,</p>
+                  <p className="pl-8"><span className="text-green-400">"humidity"</span>: <span className="text-yellow-300">65.2</span>,</p>
+                  <p className="pl-8"><span className="text-green-400">"soil_temp"</span>: <span className="text-yellow-300">24.1</span>,</p>
+                  <p className="pl-8"><span className="text-green-400">"soil_moisture"</span>: <span className="text-yellow-300">48.7</span>,</p>
+                  <p className="pl-8"><span className="text-green-400">"light"</span>: <span className="text-yellow-300">32000</span>,</p>
+                  <p className="pl-8"><span className="text-green-400">"leaf_temp"</span>: <span className="text-yellow-300">26.8</span></p>
+                  <p className="pl-4">{'}'}</p>
+                  <p>{'}'}</p>
+                </div>
+                <p className="text-gray-500 text-xs mt-4">
+                  Use <code className="text-purple-400 bg-black/20 px-1 rounded">python tools/hardware_emulator.py</code> to test with simulated hardware.
+                </p>
+              </div>
+            )}
+
+            {/* Device status grid — only shown when device has connected */}
+            {(deviceStatus || hardwareHistory.length > 0) && (<>
             <div className="grid grid-cols-6 gap-4 mb-4">
               <div className="bg-black/20 rounded-xl p-3">
                 <span className="text-gray-400 text-xs">Device ID</span>
-                <p className="text-white font-mono">{deviceStatus?.device_id || "ESP32-001"}</p>
+                <p className="text-white font-mono">{deviceStatus?.device_id || "ALETHEIA-ESP32-001"}</p>
               </div>
               <div className="bg-black/20 rounded-xl p-3">
                 <span className="text-gray-400 text-xs">Connection</span>
@@ -892,56 +1137,140 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Live Sensor Readings */}
+            {/* Live Sensor Readings — with per-sensor health status */}
             {hardwareHistory.length > 0 && (
-              <div className="grid grid-cols-6 gap-4">
+              <>
+                {/* Packet age indicator */}
                 {(() => {
                   const last = hardwareHistory[hardwareHistory.length - 1];
-                  const sd = last?.sensor_data || {};
+                  const lastTs = last?.timestamp;
+                  let age: number | null = null;
+                  let ageDisplay = "—";
+                  if (lastTs) {
+                    try {
+                      const parsed = new Date(lastTs.replace("Z", "+00:00") || lastTs);
+                      age = (Date.now() - parsed.getTime()) / 1000;
+                      if (age < 60) ageDisplay = `${Math.round(age)}s ago`;
+                      else if (age < 3600) ageDisplay = `${Math.round(age / 60)}m ago`;
+                      else ageDisplay = `${Math.round(age / 3600)}h ago`;
+                    } catch { /* keep — */ }
+                  }
+                  const ageColor = age === null ? "text-gray-500" :
+                    age < 15 ? "text-green-400" :
+                    age < 60 ? "text-yellow-400" : "text-red-400";
                   return (
-                    <>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Air Temp</span>
-                        <p className="text-white">{sd.air_temp?.toFixed(1) || "—"}°C</p>
-                      </div>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Humidity</span>
-                        <p className="text-white">{sd.humidity?.toFixed(1) || "—"}%</p>
-                      </div>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Soil Temp</span>
-                        <p className="text-white">{sd.soil_temp?.toFixed(1) || "—"}°C</p>
-                      </div>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Soil Moisture</span>
-                        <p className="text-white">{sd.soil_moisture?.toFixed(1) || "—"}%</p>
-                      </div>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Light</span>
-                        <p className="text-white">{sd.light?.toFixed(0) || "—"} lux</p>
-                      </div>
-                      <div className="bg-black/20 rounded-xl p-3">
-                        <span className="text-gray-400 text-xs">Leaf Temp</span>
-                        <p className="text-white">{sd.leaf_temp?.toFixed(1) || "—"}°C</p>
-                      </div>
-                    </>
+                    <div className="flex items-center gap-2 mb-3 text-xs">
+                      <span className="text-gray-500">Last packet:</span>
+                      <span className={`font-mono ${ageColor}`}>{ageDisplay}</span>
+                      {age !== null && age > 60 && (
+                        <span className="text-red-400/70">⚠ Device may be offline</span>
+                      )}
+                    </div>
                   );
                 })()}
-              </div>
+
+                <div className="grid grid-cols-6 gap-4">
+                  {(() => {
+                    const last = hardwareHistory[hardwareHistory.length - 1];
+                    const sd = last?.sensor_data || {};
+                    const lastTs = last?.timestamp;
+                    let packetAge: number | null = null;
+                    if (lastTs) {
+                      try {
+                        const parsed = new Date(lastTs.replace("Z", "+00:00") || lastTs);
+                        packetAge = (Date.now() - parsed.getTime()) / 1000;
+                      } catch { /* ignore */ }
+                    }
+
+                    // Absolute limits from validator.py
+                    const limits: Record<string, [number, number]> = {
+                      air_temp: [-20, 70], humidity: [0, 100], soil_temp: [-10, 60],
+                      soil_moisture: [0, 100], light: [0, 200000], leaf_temp: [-20, 75],
+                    };
+                    const sensorLabels: Record<string, string> = {
+                      air_temp: "Air Temp", humidity: "Humidity", soil_temp: "Soil Temp",
+                      soil_moisture: "Soil Moisture", light: "Light", leaf_temp: "Leaf Temp",
+                    };
+                    const sensorUnits: Record<string, string> = {
+                      air_temp: "°C", humidity: "%", soil_temp: "°C",
+                      soil_moisture: "%", light: " lux", leaf_temp: "°C",
+                    };
+                    const sensorDecimals: Record<string, number> = {
+                      air_temp: 1, humidity: 1, soil_temp: 1,
+                      soil_moisture: 1, light: 0, leaf_temp: 1,
+                    };
+
+                    const getSensorStatus = (key: string, value: any): { status: string; color: string; label: string } => {
+                      if (value === null || value === undefined) {
+                        return { status: "offline", color: "text-red-400", label: "OFFLINE" };
+                      }
+                      const [low, high] = limits[key] || [-Infinity, Infinity];
+                      if (value < low || value > high) {
+                        return { status: "invalid", color: "text-orange-400", label: "INVALID" };
+                      }
+                      if (packetAge !== null && packetAge > 60) {
+                        return { status: "stale", color: "text-yellow-400", label: "STALE" };
+                      }
+                      // Check calibration status
+                      const cal = calibrationData?.sensors?.[key];
+                      if (cal && cal.status !== "calibrated") {
+                        return { status: "uncalibrated", color: "text-blue-400", label: "UNCAL" };
+                      }
+                      return { status: "online", color: "text-green-400", label: "ONLINE" };
+                    };
+
+                    return Object.entries(sensorLabels).map(([key, label]) => {
+                      const value = sd[key];
+                      const { status, color, label: statusLabel } = getSensorStatus(key, value);
+                      const decimals = sensorDecimals[key] ?? 1;
+                      const unit = sensorUnits[key] || "";
+                      const displayValue = value != null ? `${value.toFixed(decimals)}${unit}` : "—";
+
+                      return (
+                        <div key={key} className={`bg-black/20 rounded-xl p-3 border-l-2 ${
+                          status === "online" ? "border-green-500/50" :
+                          status === "stale" ? "border-yellow-500/50" :
+                          status === "invalid" ? "border-orange-500/50" :
+                          status === "uncalibrated" ? "border-blue-500/50" :
+                          "border-red-500/50"
+                        }`}>
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-gray-400 text-xs">{label}</span>
+                            <span className={`text-[10px] font-bold uppercase ${color}`}>
+                              {statusLabel}
+                            </span>
+                          </div>
+                          <p className={`text-white ${status === "offline" ? "text-gray-600" : ""}`}>
+                            {displayValue}
+                          </p>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </>
             )}
 
-            {/* Packet Count */}
-            <div className="mt-4 text-gray-500 text-xs">
-              Total packets received: {hardwareHistory.length}
-              {deviceStatus?.packet_count != null && ` (server: ${deviceStatus.packet_count})`}
+            {/* Packet Count + Device ID */}
+            <div className="mt-4 flex items-center justify-between text-gray-500 text-xs">
+              <span>
+                Total packets: {hardwareHistory.length}
+                {deviceStatus?.packet_count != null && ` (server: ${deviceStatus.packet_count})`}
+              </span>
+              {deviceStatus?.device_id && (
+                <span className="font-mono text-purple-400">
+                  🆔 {deviceStatus.device_id}
+                </span>
+              )}
             </div>
+            </>)}
           </div>
         )}
 
         {/* ============================================================ */}
         {/* HARDWARE CALIBRATION PANEL */}
         {/* ============================================================ */}
-        {hardwareMode && calibrationData && (
+        {operatingMode === "hardware" && calibrationData && (
           <div className="bg-white/5 backdrop-blur-xl border border-purple-500/20 rounded-3xl p-6 mb-8">
             <h2 className="text-2xl text-purple-300 mb-4">📐 Sensor Calibration</h2>
             <div className="grid grid-cols-6 gap-4">
@@ -988,7 +1317,7 @@ export default function Home() {
                           const offset = parseFloat(prompt(`Offset for ${sensorLabels[sensor]} (${sensorUnits[sensor]}):`, "0") || "0");
                           const scale = parseFloat(prompt(`Scale factor for ${sensorLabels[sensor]}:`, "1") || "1");
                           if (!isNaN(offset) && !isNaN(scale)) {
-                            setCalibration("ESP32-001", sensor, offset, scale);
+                            setCalibration("ALETHEIA-ESP32-001", sensor, offset, scale);
                           }
                         }}
                         className="bg-purple-600/50 hover:bg-purple-500 text-xs rounded-lg px-2 py-1 transition flex-1"
@@ -996,7 +1325,7 @@ export default function Home() {
                         Set
                       </button>
                       <button
-                        onClick={() => resetCalibration("ESP32-001", sensor)}
+                        onClick={() => resetCalibration("ALETHEIA-ESP32-001", sensor)}
                         className="bg-red-600/30 hover:bg-red-500/50 text-xs rounded-lg px-2 py-1 transition"
                       >
                         Reset
@@ -1351,8 +1680,8 @@ export default function Home() {
                 <div className="bg-black/20 rounded-2xl p-5">
                   <p className="text-gray-400 text-sm">Temporal Confidence</p>
                   <p className="text-3xl mt-2 text-blue-300">
-                    {temporal?.future_state?.future_confidence
-                      ? `${(temporal.future_state.future_confidence * 100).toFixed(0)}%`
+                    {temporal?.future_state?.future_confidence != null
+                      ? `${Number(temporal.future_state.future_confidence).toFixed(0)}%`
                       : "—"}
                   </p>
                 </div>
@@ -1651,43 +1980,99 @@ export default function Home() {
             {/* LIVE STRESS RADAR */}
             {/* ============================================================ */}
             <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
-              <h2 className="text-3xl mb-6">Live Stress Radar</h2>
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-3xl">Live Stress Radar</h2>
+                <span className={`px-4 py-1.5 rounded-full text-sm font-bold uppercase tracking-wider ${
+                  stress?.risk_state === "healthy" ? "bg-green-500/20 text-green-400 border border-green-500/50" :
+                  stress?.risk_state === "early_warning" ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/50" :
+                  stress?.risk_state === "stress" ? "bg-orange-500/20 text-orange-400 border border-orange-500/50" :
+                  "bg-red-500/20 text-red-400 border border-red-500/50"
+                }`}>
+                  {stress?.prediction || "Analyzing"} · Severity {stress?.severity || "—"}/100
+                </span>
+              </div>
 
               <ResponsiveContainer width="100%" height={400}>
                 <RadarChart
                   data={[
                     {
-                      metric: "Heat",
-                      value: Math.min((sensor?.air_temp || 0) * 2, 100),
+                      metric: "Heat Stress",
+                      value: Math.min(Math.max(
+                        ((sensor?.air_temp || 25) - 20) / 20 * 100, 0
+                      ), 100),
+                      fullMark: 100,
                     },
                     {
-                      metric: "Humidity",
-                      value: Math.min(100 - (sensor?.humidity || 0), 100),
+                      metric: "Humidity Deficit",
+                      value: Math.min(Math.max(
+                        (70 - (sensor?.humidity || 60)) / 50 * 100, 0
+                      ), 100),
+                      fullMark: 100,
                     },
                     {
-                      metric: "Leaf",
-                      value: Math.min((sensor?.leaf_temp_delta || 0) * 15, 100),
+                      metric: "Leaf ΔT Risk",
+                      value: Math.min(Math.max(
+                        (sensor?.leaf_temp_delta || 2) / 8 * 100, 0
+                      ), 100),
+                      fullMark: 100,
                     },
                     {
-                      metric: "Root",
-                      value: Math.min((sensor?.soil_temp || 0) * 2, 100),
+                      metric: "Root Zone",
+                      value: Math.min(Math.max(
+                        ((sensor?.soil_temp || 22) - 18) / 20 * 100, 0
+                      ), 100),
+                      fullMark: 100,
                     },
                     {
-                      metric: "Water",
-                      value: Math.min(100 - (sensor?.soil_moisture || 0), 100),
+                      metric: "Water Stress",
+                      value: Math.min(Math.max(
+                        (60 - (sensor?.soil_moisture || 50)) / 40 * 100, 0
+                      ), 100),
+                      fullMark: 100,
+                    },
+                    {
+                      metric: "Light Intensity",
+                      value: Math.min(Math.max(
+                        ((sensor?.light || 30000) - 5000) / 80000 * 100, 0
+                      ), 100),
+                      fullMark: 100,
                     },
                   ]}
                 >
-                  <PolarGrid />
-                  <PolarAngleAxis dataKey="metric" />
+                  <PolarGrid stroke="#333" />
+                  <PolarAngleAxis
+                    dataKey="metric"
+                    tick={{ fill: "#888", fontSize: 11 }}
+                  />
+                  <PolarRadiusAxis
+                    angle={30}
+                    domain={[0, 100]}
+                    tick={{ fill: "#555", fontSize: 9 }}
+                  />
                   <Radar
                     dataKey="value"
                     stroke="#00ff99"
                     fill="#00ff99"
-                    fillOpacity={0.4}
+                    fillOpacity={0.35}
+                    strokeWidth={2}
                   />
                 </RadarChart>
               </ResponsiveContainer>
+
+              {/* Stress reasons from AI */}
+              {stress?.reasons && stress.reasons.length > 0 && (
+                <div className="mt-6 bg-black/20 rounded-2xl p-5">
+                  <h3 className="text-sm text-gray-400 mb-3">AI Stress Factors</h3>
+                  <div className="space-y-2">
+                    {stress.reasons.map((reason: string, idx: number) => (
+                      <div key={idx} className="flex items-start gap-2 text-sm">
+                        <span className="text-yellow-400 mt-0.5">•</span>
+                        <span className="text-gray-300">{reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* ============================================================ */}
@@ -1809,7 +2194,21 @@ export default function Home() {
             {/* ============================================================ */}
             {aiReasoning && (
               <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
-                <h2 className="text-3xl mb-6">AI Reasoning Console</h2>
+                <div className="flex items-center justify-between mb-6">
+                  <h2 className="text-3xl">AI Reasoning Console</h2>
+                  {/* Source badge: AI-generated vs Fallback */}
+                  <span className={`px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider ${
+                    aiReasoning._fallback || aiReasoning._partial
+                      ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/50"
+                      : "bg-green-500/20 text-green-400 border border-green-500/50"
+                  }`}>
+                    {aiReasoning._fallback
+                      ? "⚡ Fallback (Model Offline)"
+                      : aiReasoning._partial
+                      ? "⚠ Partial (Truncated)"
+                      : "✓ OpenRouter AI"}
+                  </span>
+                </div>
 
                 <div className="grid grid-cols-2 gap-6">
                   <div className="bg-black/20 rounded-2xl p-6">
@@ -1878,32 +2277,105 @@ export default function Home() {
             </div>
 
             {/* ============================================================ */}
-            {/* CONFIDENCE PANEL */}
+            {/* CONFIDENCE PANEL — with cold-start awareness */}
             {/* ============================================================ */}
             <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
               <h2 className="text-3xl mb-6">Prediction Confidence</h2>
 
+              {/* Cold-start warning for hardware mode with insufficient history */}
+              {operatingMode === "hardware" && hardwareHistory.length < 5 && (
+                <div className="mb-6 bg-yellow-500/10 border border-yellow-500/20 rounded-2xl p-4 flex items-center gap-3">
+                  <span className="text-yellow-400 text-xl">⏳</span>
+                  <div>
+                    <p className="text-yellow-300 font-bold">Temporal AI Warming Up</p>
+                    <p className="text-yellow-400/70 text-sm">
+                      {hardwareHistory.length === 0
+                        ? "No hardware packets received yet. Temporal confidence unavailable until data arrives."
+                        : `Only ${hardwareHistory.length} packet(s) received. Need ≥5 for reliable temporal predictions.`}
+                    </p>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-5 gap-4">
+                {/* Sensor Confidence */}
                 <div className="bg-black/20 rounded-2xl p-5 text-center">
                   <p className="text-gray-400 text-sm">Sensor</p>
-                  <p className="text-2xl mt-2">{confidence?.sensor_confidence}%</p>
+                  <p className={`text-2xl mt-2 ${
+                    (confidence?.sensor_confidence ?? 0) >= 80 ? "text-green-400" :
+                    (confidence?.sensor_confidence ?? 0) >= 50 ? "text-yellow-400" : "text-red-400"
+                  }`}>
+                    {confidence?.sensor_confidence != null ? `${Number(confidence.sensor_confidence).toFixed(0)}%` : "—"}
+                  </p>
+                  <p className="text-gray-500 text-[10px] mt-1">HW Validation</p>
                 </div>
+
+                {/* AI Model Confidence */}
                 <div className="bg-black/20 rounded-2xl p-5 text-center">
                   <p className="text-gray-400 text-sm">AI Model</p>
-                  <p className="text-2xl mt-2">{confidence?.ai_confidence}%</p>
+                  <p className={`text-2xl mt-2 ${
+                    (confidence?.ai_confidence ?? 0) >= 80 ? "text-green-400" :
+                    (confidence?.ai_confidence ?? 0) >= 50 ? "text-yellow-400" : "text-red-400"
+                  }`}>
+                    {confidence?.ai_confidence != null ? `${Number(confidence.ai_confidence).toFixed(0)}%` : "—"}
+                  </p>
+                  <p className="text-gray-500 text-[10px] mt-1">Decision Engine</p>
                 </div>
+
+                {/* Temporal Confidence — with cold-start indicator */}
                 <div className="bg-black/20 rounded-2xl p-5 text-center">
                   <p className="text-gray-400 text-sm">Temporal</p>
-                  <p className="text-2xl mt-2">{confidence?.temporal_confidence}%</p>
+                  <p className={`text-2xl mt-2 ${
+                    operatingMode === "hardware" && hardwareHistory.length < 5
+                      ? "text-yellow-400"
+                      : (confidence?.temporal_confidence ?? 0) >= 80 ? "text-green-400"
+                      : (confidence?.temporal_confidence ?? 0) >= 50 ? "text-yellow-400"
+                      : "text-red-400"
+                  }`}>
+                    {operatingMode === "hardware" && hardwareHistory.length < 5
+                      ? "Warming"
+                      : confidence?.temporal_confidence != null
+                      ? `${Number(confidence.temporal_confidence).toFixed(0)}%`
+                      : "—"}
+                  </p>
+                  <p className="text-gray-500 text-[10px] mt-1">
+                    {operatingMode === "hardware" && hardwareHistory.length < 5
+                      ? "Need ≥5 packets"
+                      : "Future Prediction"}
+                  </p>
                 </div>
+
+                {/* Biology Health Score */}
                 <div className="bg-black/20 rounded-2xl p-5 text-center">
                   <p className="text-gray-400 text-sm">Biology</p>
-                  <p className="text-2xl mt-2">{confidence?.biology_health_score}%</p>
+                  <p className={`text-2xl mt-2 ${
+                    (confidence?.biology_health_score ?? 0) >= 80 ? "text-green-400" :
+                    (confidence?.biology_health_score ?? 0) >= 50 ? "text-yellow-400" : "text-red-400"
+                  }`}>
+                    {confidence?.biology_health_score != null ? `${Number(confidence.biology_health_score).toFixed(0)}%` : "—"}
+                  </p>
+                  <p className="text-gray-500 text-[10px] mt-1">Plant Health</p>
                 </div>
-                <div className="bg-black/20 rounded-2xl p-5 text-center border border-green-500/30">
+
+                {/* Overall Confidence */}
+                <div className={`bg-black/20 rounded-2xl p-5 text-center border ${
+                  (confidence?.overall ?? 0) >= 80 ? "border-green-500/30" :
+                  (confidence?.overall ?? 0) >= 50 ? "border-yellow-500/30" : "border-red-500/30"
+                }`}>
                   <p className="text-gray-400 text-sm">Overall</p>
-                  <p className="text-3xl mt-2 text-green-400">{confidence?.overall}%</p>
+                  <p className={`text-3xl mt-2 ${
+                    (confidence?.overall ?? 0) >= 80 ? "text-green-400" :
+                    (confidence?.overall ?? 0) >= 50 ? "text-yellow-400" : "text-red-400"
+                  }`}>
+                    {confidence?.overall != null ? `${Number(confidence.overall).toFixed(0)}%` : "—"}
+                  </p>
+                  <p className="text-gray-500 text-[10px] mt-1">Weighted Avg</p>
                 </div>
+              </div>
+
+              {/* Confidence breakdown weights */}
+              <div className="mt-4 text-xs text-gray-500 text-center">
+                Weights: Sensor 15% · AI Model 30% · Temporal 25% · Biology 30%
               </div>
             </div>
 

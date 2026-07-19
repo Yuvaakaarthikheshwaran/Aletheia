@@ -898,6 +898,17 @@ def hardware_update():
     Returns: Full unified analysis + hardware metadata.
     """
     try:
+        # Step 0: Authenticate — require HARDWARE_API_KEY for production safety
+        HARDWARE_API_KEY = os.environ.get("HARDWARE_API_KEY", "")
+        if HARDWARE_API_KEY:
+            auth_header = request.headers.get("Authorization", "")
+            expected = f"Bearer {HARDWARE_API_KEY}"
+            if auth_header != expected:
+                return jsonify({
+                    "error": "unauthorized",
+                    "message": "Valid HARDWARE_API_KEY required. Send Authorization: Bearer <key> header.",
+                }), 401
+
         raw_body = request.get_data()
 
         # Step 1: Validate hardware packet (runs BEFORE sensor_guard)
