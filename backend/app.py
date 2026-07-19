@@ -31,7 +31,18 @@ if AI_DIR not in sys.path:
     sys.path.append(AI_DIR)
 
 from backend.fuzzy_search import search_plants
-from backend.unified_pipeline import run_unified_pipeline
+from backend.unified_pipeline import (
+    run_unified_pipeline,
+    _get_or_fetch_plant_profile,
+    _build_temporal_input,
+    _build_decision_input,
+    _call_openrouter_reasoning,
+)
+from backend.ai_reasoning_cache import store_ai_reasoning
+from backend.biology_engine import evaluate_biology
+from ai.sensor_guard import validate_sensor_data
+from ai.unified_engine import unified_analysis
+from ai.decision_engine import analyze as decision_analyze
 
 # Digital Twin Simulator (additive — does not modify existing pipeline)
 from backend.simulator import GreenhouseSimulator, SCENARIOS
@@ -365,6 +376,151 @@ def simulator_analyze():
         },
         "analysis": analysis,
     })
+
+
+# ============================================================
+# AI Reasoning — Dedicated Retry Endpoint
+# ============================================================
+
+@app.route("/simulator/reasoning", methods=["POST"])
+def simulator_reasoning():
+    """
+    Re-run ONLY the OpenRouter AI reasoning step on existing analysis data.
+    This allows the frontend to retry AI reasoning without re-running the
+    full pipeline (which would advance the simulator).
+
+    Body: {
+        plant: "tomato",
+        stage: "vegetative",
+        phase: "day",
+        sensor_data: { ... },
+        sensor_stream: [ ... ]  // optional historical context
+    }
+
+    Returns: { ai_reasoning: { ... }, recommendations: [...] }
+    """
+    body = request.get_json(silent=True) or {}
+    plant_name = body.get("plant", "tomato")
+    growth_stage = body.get("stage", "vegetative")
+    phase = body.get("phase", "day")
+    sensor_data = body.get("sensor_data", {})
+    sensor_stream = body.get("sensor_stream", None)
+
+    if not sensor_data:
+        return jsonify({"error": "sensor_data is required"}), 400
+
+    try:
+        # Step 1: Get plant profile
+        plant_profile = _get_or_fetch_plant_profile(plant_name)
+
+        # Step 2: Validate sensor data
+        sensor_result = validate_sensor_data(sensor_data)
+        repaired_data = sensor_result["repaired_data"]
+
+        # Step 3: Temporal AI prediction (needed for context)
+        temporal_input = _build_temporal_input(repaired_data, sensor_stream)
+        temporal_result = unified_analysis(repaired_data, temporal_input)
+
+        # Step 4: Biology evaluation (needed for context)
+        biology_result = evaluate_biology(repaired_data, plant_profile, growth_stage, phase)
+
+        # Step 5: Decision engine (needed for context)
+        decision_input = _build_decision_input(repaired_data)
+        decision_result = decision_analyze(decision_input)
+        stress_analysis = {
+            "prediction": decision_result.get("prediction"),
+            "severity": decision_result.get("severity"),
+            "risk_state": decision_result.get("risk_state"),
+            "reasons": decision_result.get("reasons"),
+            "recommendation": decision_result.get("recommendation"),
+        }
+
+        # Step 6: Confidence aggregation
+        confidence = {
+            "sensor_confidence": sensor_result["sensor_confidence"],
+            "ai_confidence": decision_result.get("confidence", 0),
+            "temporal_confidence": (
+                temporal_result.get("future_state", {}).get("future_confidence", 0)
+                if temporal_result.get("status") == "ok"
+                else 0
+            ),
+            "biology_health_score": biology_result.get("health_score", 0),
+        }
+        weights = {"sensor": 0.15, "ai": 0.30, "temporal": 0.25, "biology": 0.30}
+        confidence["overall"] = round(
+            confidence["sensor_confidence"] * weights["sensor"]
+            + confidence["ai_confidence"] * weights["ai"]
+            + confidence["temporal_confidence"] * weights["temporal"]
+            + confidence["biology_health_score"] * weights["biology"],
+            2,
+        )
+
+        # Step 7: OpenRouter AI Reasoning (force fresh call, skip cache)
+        import hashlib
+        reasoning_context_str = json.dumps({
+            "plant": plant_name,
+            "stage": growth_stage,
+            "phase": phase,
+            "sensor_summary": {
+                "air_temp": repaired_data.get("air_temp"),
+                "humidity": repaired_data.get("humidity"),
+                "soil_moisture": repaired_data.get("soil_moisture"),
+                "leaf_temp_delta": repaired_data.get("leaf_temp_delta"),
+            },
+            "temporal_prediction_label": temporal_result.get("future_state", {}).get("future_prediction"),
+            "stress_prediction_label": stress_analysis.get("prediction"),
+        }, sort_keys=True)
+        cache_key = hashlib.md5(reasoning_context_str.encode("utf-8")).hexdigest()
+
+        # Force fresh call — bypass cache for retry
+        ai_reasoning = _call_openrouter_reasoning(
+            plant_name=plant_name,
+            plant_profile=plant_profile,
+            sensor_data=repaired_data,
+            temporal_prediction=temporal_result,
+            biology_analysis=biology_result,
+            stress_analysis=stress_analysis,
+            confidence_scores=confidence,
+        )
+
+        # Store successful result in cache for future use
+        if ai_reasoning and not ai_reasoning.get("_fallback") and not ai_reasoning.get("_partial"):
+            store_ai_reasoning(cache_key, ai_reasoning)
+
+        # Merge recommendations
+        recommendations = []
+        if decision_result.get("recommendation"):
+            recommendations.append(decision_result["recommendation"])
+        for w in biology_result.get("warnings", []):
+            recommendations.append(w)
+        if ai_reasoning.get("recommendations"):
+            recommendations.extend(ai_reasoning["recommendations"])
+        recommendations = list(dict.fromkeys(recommendations))
+
+        return jsonify({
+            "ai_reasoning": ai_reasoning,
+            "recommendations": recommendations,
+        })
+
+    except Exception as e:
+        logger.error(f"AI Reasoning retry failed: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "error": "ai_reasoning_failed",
+            "message": str(e),
+            "ai_reasoning": {
+                "explanation": "AI reasoning engine unavailable. Analysis based on sensor data and biological models.",
+                "diagnosis": "Unable to generate AI diagnosis at this time.",
+                "recommendations": [
+                    "Monitor sensor readings closely",
+                    "Check plant for visible stress signs",
+                    "Review biology engine warnings"
+                ],
+                "confidence_narrative": "Confidence based on sensor validation and temporal models only.",
+                "_fallback": True,
+                "_api_error": True,
+            },
+        }), 500
 
 
 # ============================================================

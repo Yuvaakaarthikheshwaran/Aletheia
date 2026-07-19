@@ -150,6 +150,7 @@ export default function Home() {
   const [calibrationData, setCalibrationData] = useState<any>(null);
   const [sessionExportLoading, setSessionExportLoading] = useState(false);
   const [hardwarePacketStatus, setHardwarePacketStatus] = useState<string | null>(null);
+  const [aiReasoningLoading, setAiReasoningLoading] = useState(false);
 
   // --- Temporal Navigation State (NEW) ---
   // selectedTime: null = LIVE/NOW; number = viewing a specific sim_minute
@@ -401,6 +402,45 @@ export default function Home() {
     }
     setLoading(false);
   }, [selectedPlant, growthStage, phase, fetchDeviceStatus, fetchHardwareHistory]);
+
+  // --- AI Reasoning: retry ---
+  const retryAIReasoning = useCallback(async () => {
+    setAiReasoningLoading(true);
+
+    // Read current sensor data and trajectory from the latest data state
+    const currentData = data;
+    const currentSensor = currentData?.sensor_validation?.repaired_data
+      || currentData?._simulator?.sensor_data;
+    const currentTrajectory: any[] = currentData?._simulator?.trajectory || [];
+
+    const result = await safeFetch("/simulator/reasoning", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        plant: selectedPlant,
+        stage: growthStage,
+        phase: phase,
+        sensor_data: currentSensor || {},
+        sensor_stream: currentTrajectory,
+      }),
+    });
+
+    if (result.ok && result.data) {
+      const json = result.data;
+      if (json.ai_reasoning) {
+        setData((prev: any) => ({
+          ...prev,
+          ai_reasoning: json.ai_reasoning,
+          recommendations: json.recommendations || prev?.recommendations,
+        }));
+      } else if (json.error) {
+        console.error("AI Reasoning retry error:", json.error);
+      }
+    } else {
+      console.error("AI Reasoning retry failed:", result.error);
+    }
+    setAiReasoningLoading(false);
+  }, [selectedPlant, growthStage, phase, data]);
 
   // --- Session: save/export ---
   const saveSession = useCallback(async (source: string = "simulator", format: string = "both") => {
@@ -2192,33 +2232,51 @@ export default function Home() {
             {/* ============================================================ */}
             {/* AI REASONING CONSOLE */}
             {/* ============================================================ */}
-            {aiReasoning && (
-              <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
-                <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-3xl">AI Reasoning Console</h2>
+            <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-8 mb-8">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-3xl">AI Reasoning Console</h2>
+                <div className="flex items-center gap-3">
                   {/* Source badge: AI-generated vs Fallback */}
-                  <span className={`px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider ${
-                    aiReasoning._fallback || aiReasoning._partial
-                      ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/50"
-                      : "bg-green-500/20 text-green-400 border border-green-500/50"
-                  }`}>
-                    {aiReasoning._fallback
-                      ? "⚡ Fallback (Model Offline)"
-                      : aiReasoning._partial
-                      ? "⚠ Partial (Truncated)"
-                      : "✓ OpenRouter AI"}
-                  </span>
+                  {aiReasoning ? (
+                    <span className={`px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider ${
+                      aiReasoning._fallback || aiReasoning._partial
+                        ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/50"
+                        : "bg-green-500/20 text-green-400 border border-green-500/50"
+                    }`}>
+                      {aiReasoning._fallback
+                        ? "⚡ Fallback (Model Offline)"
+                        : aiReasoning._partial
+                        ? "⚠ Partial (Truncated)"
+                        : "✓ OpenRouter AI"}
+                    </span>
+                  ) : (
+                    <span className="px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider bg-gray-500/20 text-gray-400 border border-gray-500/50">
+                      ◌ Waiting for Data
+                    </span>
+                  )}
+                  {/* Retry button — only show when fallback or no data */}
+                  {(!aiReasoning || aiReasoning._fallback || aiReasoning._partial) && (
+                    <button
+                      onClick={retryAIReasoning}
+                      disabled={aiReasoningLoading}
+                      className="px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/50 hover:bg-blue-500/30 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {aiReasoningLoading ? "⟳ Calling AI..." : "↻ Retry AI Reasoning"}
+                    </button>
+                  )}
                 </div>
+              </div>
 
+              {aiReasoning ? (
                 <div className="grid grid-cols-2 gap-6">
                   <div className="bg-black/20 rounded-2xl p-6">
                     <h3 className="text-xl text-green-400 mb-3">Explanation</h3>
-                    <p className="text-gray-300">{aiReasoning.explanation}</p>
+                    <p className="text-gray-300">{aiReasoning.explanation || "No explanation available."}</p>
                   </div>
 
                   <div className="bg-black/20 rounded-2xl p-6">
                     <h3 className="text-xl text-yellow-400 mb-3">Diagnosis</h3>
-                    <p className="text-gray-300">{aiReasoning.diagnosis}</p>
+                    <p className="text-gray-300">{aiReasoning.diagnosis || "No diagnosis available."}</p>
                   </div>
 
                   <div className="bg-black/20 rounded-2xl p-6 col-span-2">
@@ -2226,12 +2284,19 @@ export default function Home() {
                       Confidence Narrative
                     </h3>
                     <p className="text-gray-300">
-                      {aiReasoning.confidence_narrative}
+                      {aiReasoning.confidence_narrative || "No confidence narrative available."}
                     </p>
                   </div>
                 </div>
-              </div>
-            )}
+              ) : (
+                <div className="text-center py-12 text-gray-500">
+                  <p className="text-lg mb-2">AI Reasoning Console awaiting analysis data.</p>
+                  <p className="text-sm">
+                    Run an analysis or click <span className="text-blue-400">Retry AI Reasoning</span> to generate insights.
+                  </p>
+                </div>
+              )}
+            </div>
 
             {/* ============================================================ */}
             {/* WARNINGS + RECOMMENDATIONS */}
