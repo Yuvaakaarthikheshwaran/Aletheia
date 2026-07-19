@@ -34,8 +34,27 @@ from backend.parser_extractor import parse_plant_data
 from backend.openrouter_extractor import extract_with_openrouter
 from backend.plant_profile_schema import DEFAULT_PROFILE
 from backend.ai_reasoning_cache import get_cached_ai_reasoning, store_ai_reasoning
-from backend.local_reasoning import generate_local_reasoning
 import hashlib
+
+# Safe import: local_reasoning may not exist on HF Space until redeployed
+try:
+    from backend.local_reasoning import generate_local_reasoning
+    _HAS_LOCAL_REASONING = True
+except ImportError:
+    _HAS_LOCAL_REASONING = False
+    def generate_local_reasoning(*args, **kwargs):
+        """Fallback stub when local_reasoning module is not deployed yet."""
+        return {
+            "explanation": "AI reasoning module is being deployed. Analysis based on sensor data and biological models.",
+            "diagnosis": "Local reasoning engine not yet available on this deployment.",
+            "recommendations": [
+                "Monitor sensor readings closely",
+                "Check plant for visible stress signs",
+                "Review biology engine warnings"
+            ],
+            "confidence_narrative": "Confidence based on sensor validation and temporal models only.",
+            "_source": "local_reasoning_stub",
+        }
 
 
 def _get_or_fetch_plant_profile(plant_name: str) -> dict:

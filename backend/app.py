@@ -39,8 +39,25 @@ from backend.unified_pipeline import (
     _call_openrouter_reasoning,
 )
 from backend.ai_reasoning_cache import store_ai_reasoning
-from backend.local_reasoning import generate_local_reasoning
 from backend.biology_engine import evaluate_biology
+
+# Safe import: local_reasoning may not exist on HF Space until redeployed
+try:
+    from backend.local_reasoning import generate_local_reasoning
+except ImportError:
+    def generate_local_reasoning(*args, **kwargs):
+        """Fallback stub when local_reasoning module is not deployed yet."""
+        return {
+            "explanation": "AI reasoning module is being deployed. Analysis based on sensor data and biological models.",
+            "diagnosis": "Local reasoning engine not yet available on this deployment.",
+            "recommendations": [
+                "Monitor sensor readings closely",
+                "Check plant for visible stress signs",
+                "Review biology engine warnings"
+            ],
+            "confidence_narrative": "Confidence based on sensor validation and temporal models only.",
+            "_source": "local_reasoning_stub",
+        }
 from ai.sensor_guard import validate_sensor_data
 from ai.unified_engine import unified_analysis
 from ai.decision_engine import analyze as decision_analyze
