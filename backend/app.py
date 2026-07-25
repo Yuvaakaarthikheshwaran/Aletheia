@@ -40,6 +40,7 @@ from backend.unified_pipeline import (
 )
 from backend.ai_reasoning_cache import store_ai_reasoning
 from backend.biology_engine import evaluate_biology
+from backend.yield_intelligence import evaluate_yield_intelligence
 
 # Safe import: local_reasoning may not exist on HF Space until redeployed
 try:
@@ -358,6 +359,7 @@ def simulator_analyze():
             "confidence": analysis.get("confidence"),
             "ai_reasoning": analysis.get("ai_reasoning"),
             "decision_input": analysis.get("decision_input"),
+            "yield_intelligence": analysis.get("yield_intelligence"),
         }
 
     # Build historical trajectory for frontend visualization
@@ -1413,6 +1415,7 @@ def session_save():
                     "recommendations": snap.get("recommendations"),
                     "confidence": snap.get("confidence"),
                     "ai_reasoning": snap.get("ai_reasoning"),
+                    "yield_intelligence": snap.get("yield_intelligence"),
                 }
 
             timeline.append(entry)
@@ -1556,6 +1559,109 @@ def session_export():
         json={"source": source, "format": output_format, "include_replay": True},
     ):
         return session_save()
+
+
+# ============================================================
+# Yield Intelligence Endpoint
+# ============================================================
+
+@app.route("/yield", methods=["POST"])
+def yield_intelligence():
+    """
+    Dedicated Yield Intelligence endpoint.
+    
+    Accepts the same input as /analyze but returns ONLY the yield
+    intelligence layer. Useful for lightweight yield queries without
+    re-running the full AI pipeline.
+    
+    Input JSON:
+    {
+        "plant": "Tomato",
+        "stage": "Flowering",
+        "mode": "Day",
+        "sensor_data": { ... },
+        "sensor_stream": [ ... ]   // optional historical data
+    }
+    
+    Returns: yield_intelligence dict.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        
+        plant_name = body.get("plant", "tomato")
+        growth_stage = body.get("stage", "vegetative")
+        phase = body.get("mode", "day").lower()
+        sensor_data = body.get("sensor_data", {})
+        sensor_stream = body.get("sensor_stream", None)
+        
+        if not sensor_data:
+            return jsonify({
+                "error": "Missing sensor_data",
+                "message": "Provide at least air_temp, humidity, soil_moisture"
+            }), 400
+        
+        # Get plant profile
+        plant_profile = _get_or_fetch_plant_profile(plant_name)
+        
+        # Validate sensor data
+        sensor_result = validate_sensor_data(sensor_data)
+        repaired_data = sensor_result["repaired_data"]
+        
+        # Run biology engine for health score
+        biology_result = evaluate_biology(
+            repaired_data, plant_profile, growth_stage, phase
+        )
+        
+        # Run decision engine for stress analysis
+        decision_input = _build_decision_input(repaired_data)
+        decision_result = decision_analyze(decision_input)
+        stress_analysis = {
+            "prediction": decision_result.get("prediction"),
+            "severity": decision_result.get("severity"),
+            "risk_state": decision_result.get("risk_state"),
+            "reasons": decision_result.get("reasons"),
+            "recommendation": decision_result.get("recommendation"),
+        }
+        
+        # Run temporal AI
+        temporal_input = _build_temporal_input(repaired_data, sensor_stream)
+        temporal_result = unified_analysis(repaired_data, temporal_input)
+        
+        # Build confidence
+        confidence = {
+            "sensor_confidence": sensor_result["sensor_confidence"],
+            "ai_confidence": decision_result.get("confidence", 0),
+            "temporal_confidence": (
+                temporal_result.get("future_state", {}).get("future_confidence", 0)
+                if temporal_result.get("status") == "ok"
+                else 0
+            ),
+            "biology_health_score": biology_result.get("health_score", 0),
+        }
+        
+        # Run Yield Intelligence
+        yield_result = evaluate_yield_intelligence(
+            plant_name=plant_name,
+            growth_stage=growth_stage,
+            phase=phase,
+            sensor_data=repaired_data,
+            sensor_stream=sensor_stream,
+            plant_profile=plant_profile,
+            biology_analysis=biology_result,
+            stress_analysis=stress_analysis,
+            temporal_prediction=temporal_result,
+            confidence_scores=confidence,
+            recommendations=[],
+        )
+        
+        return jsonify(yield_result)
+        
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "error": "yield_intelligence_failure",
+            "message": str(e),
+        }), 500
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import {
   ReferenceLine,
   Legend,
 } from "recharts";
+import YieldIntelligence from "./components/YieldIntelligence";
 
 const RAW_API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 // Normalize: strip trailing slash so we never produce double-slashes like //analyze
@@ -572,6 +573,7 @@ export default function Home() {
   const aiReasoning = data?.ai_reasoning;
   const confidence = data?.confidence;
   const recommendations = data?.recommendations;
+  const yieldIntel = data?.yield_intelligence;
   const simulator = data?._simulator;
   const causalChain = simulator?.causal_chain || simState?.causal_chain || [];
 
@@ -1494,6 +1496,15 @@ export default function Home() {
                 </div>
               </div>
             </div>
+
+            {/* ============================================================ */}
+            {/* YIELD INTELLIGENCE — Yield Potential, Loss Risk, Recommendations */}
+            {/* ============================================================ */}
+            <YieldIntelligence
+              data={yieldIntel}
+              operatingMode={operatingMode}
+              hardwareHistory={hardwareHistory.length}
+            />
 
             {/* ============================================================ */}
             {/* CAUSAL CHAIN — Explainability */}

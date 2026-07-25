@@ -34,6 +34,7 @@ from backend.parser_extractor import parse_plant_data
 from backend.openrouter_extractor import extract_with_openrouter
 from backend.plant_profile_schema import DEFAULT_PROFILE
 from backend.ai_reasoning_cache import get_cached_ai_reasoning, store_ai_reasoning
+from backend.yield_intelligence import evaluate_yield_intelligence
 import hashlib
 
 # Safe import: local_reasoning may not exist on HF Space until redeployed
@@ -480,7 +481,23 @@ def run_unified_pipeline(
     # Deduplicate
     response["recommendations"] = list(dict.fromkeys(recommendations))
 
-    # --- Step 9: Timestamp ---
+    # --- Step 9: Yield Intelligence ---
+    yield_result = evaluate_yield_intelligence(
+        plant_name=plant_name,
+        growth_stage=growth_stage,
+        phase=phase,
+        sensor_data=repaired_data,
+        sensor_stream=sensor_stream,
+        plant_profile=plant_profile,
+        biology_analysis=biology_result,
+        stress_analysis=response["stress_analysis"],
+        temporal_prediction=temporal_result,
+        confidence_scores=confidence,
+        recommendations=recommendations,
+    )
+    response["yield_intelligence"] = yield_result
+
+    # --- Step 10: Timestamp ---
     from datetime import datetime, timezone
     response["timestamp"] = datetime.now(timezone.utc).isoformat()
 

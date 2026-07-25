@@ -81,5 +81,23 @@ DEFAULT_PROFILE = {
         "cold_stress": 12,
         "drought_stress": 30,
         "waterlogging_stress": 90
+    },
+
+    "yield_knowledge": {
+        "typical_yield_range": None,
+        "typical_yield_range_field": None,
+        "critical_stages": ["flowering", "fruiting"],
+        "heat_sensitivity": 0.70,
+        "cold_sensitivity": 0.60,
+        "water_sensitivity": 0.80,
+        "light_sensitivity": 0.50,
+        "stage_sensitivity_overrides": {},
+        "absolute_yield_requirements": [
+            "cultivar",
+            "plant_density",
+            "growth_stage",
+            "crop_specific_yield_data"
+        ],
+        "source": "generic_fallback — no crop-specific data available"
     }
 }

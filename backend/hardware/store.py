@@ -73,6 +73,7 @@ class HardwareStore:
                 "confidence": analysis.get("confidence"),
                 "ai_reasoning": analysis.get("ai_reasoning"),
                 "decision_input": analysis.get("decision_input"),
+                "yield_intelligence": analysis.get("yield_intelligence"),
             }
 
         self.history.append(entry)
